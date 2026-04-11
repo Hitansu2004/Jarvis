@@ -47,6 +47,8 @@ logger = logging.getLogger("jarvis.gateway")
 from core_engine.agent_registry import AgentRegistry
 from core_engine.mode_manager import ModeManager, get_mode_manager
 from core_engine.router import ComplexityRouter
+from sandbox.security_enforcer import SecurityEnforcer, get_security_enforcer
+from sandbox.audit_manager import AuditManager, get_audit_manager
 
 # ---------------------------------------------------------------------------
 # Paths & constants
@@ -61,6 +63,8 @@ _SERVER_PORT = int(os.getenv("SERVER_PORT", "8000"))
 _registry: Optional[AgentRegistry] = None
 _router: Optional[ComplexityRouter] = None
 _mode_manager: Optional[ModeManager] = None
+_security_enforcer: Optional[SecurityEnforcer] = None
+_audit: Optional[AuditManager] = None
 
 
 # ===========================================================================
@@ -135,6 +139,9 @@ class SpecSheet(BaseModel):
     created_at: str = ""
 
 
+class SecurityConfirmRequest(BaseModel):
+    confirmation_key: str
+
 # ===========================================================================
 # Helper utilities
 # ===========================================================================
@@ -192,7 +199,9 @@ async def lifespan(app: FastAPI):
     - Initialises singletons (AgentRegistry, ComplexityRouter, ModeManager)
     - Prints JARVIS boot message
     """
-    global _registry, _router, _mode_manager
+    global _registry, _router, _mode_manager, _security_enforcer, _audit
+
+    import asyncio
 
     # ---- Create required directories ----
     _AUDIT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -207,6 +216,15 @@ async def lifespan(app: FastAPI):
     _registry = AgentRegistry()
     _router = ComplexityRouter()
     _mode_manager = get_mode_manager()
+    _security_enforcer = get_security_enforcer()
+    _audit = get_audit_manager()
+
+    async def cleanup_loop():
+        while True:
+            await asyncio.sleep(60)
+            _security_enforcer.cleanup_expired()
+            
+    asyncio.create_task(cleanup_loop())
 
     # ---- JARVIS Boot Message ----
     greeting = _get_greeting()
@@ -585,3 +603,33 @@ async def control_override():
         "status": "control_returned",
         "timestamp": _iso_now(),
     }
+
+# ===========================================================================
+# Phase 2 — Security Routes
+# ===========================================================================
+
+@app.post("/security/confirm")
+async def security_confirm(request: SecurityConfirmRequest):
+    result = _security_enforcer.confirm(request.confirmation_key)
+    return result
+
+@app.post("/security/cancel")
+async def security_cancel(request: SecurityConfirmRequest):
+    result = _security_enforcer.cancel(request.confirmation_key)
+    return result
+
+@app.get("/security/status")
+async def security_status():
+    return _security_enforcer.get_security_status()
+
+@app.get("/security/audit")
+async def security_audit(limit: int = 50, action_type: Optional[str] = None):
+    # Retrieve via AuditManager which is the security log engine
+    entries = _audit.get_recent(limit=limit, action_type=action_type)
+    return {"entries": entries, "total": len(entries)}
+
+@app.get("/security/violations")
+async def security_violations(since_hours: int = 24):
+    violations = _audit.get_violations(since_hours=since_hours)
+    return {"violations": violations, "count": len(violations)}
+

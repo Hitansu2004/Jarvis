@@ -72,3 +72,61 @@ api_keys:
   speak: false
   write_to_memory: false
   note: "API keys are invisible to all agents. Mode manager handles them."
+
+# --- PHASE 2 ADDITIONS ---
+
+# Sensitive file patterns — extra warnings even in allowed directories
+sensitive_patterns:
+  file_extensions:
+    - ".env"
+    - ".key"
+    - ".pem"
+    - ".p12"
+    - ".pfx"
+    - ".cert"
+    - ".crt"
+    - ".keystore"
+  file_names:
+    - ".env"
+    - ".env.local"
+    - ".env.production"
+    - "id_rsa"
+    - "id_ed25519"
+    - "*.secret"
+    - "credentials.json"
+    - "jarvis_vertex_key.json"
+
+# Pending confirmation settings
+confirmation_settings:
+  expiry_seconds: 300       # 5 minutes before pending expires
+  cleanup_interval_seconds: 60
+  file_preview_chars: 100   # Characters to read for FILE_DELETE preview
+
+# Security violation response
+violations:
+  speak_alert: true         # Print TTS-style alert to console
+  log_immediately: true     # Write to audit log without delay
+  alert_prefix: "[JARVIS SECURITY]"
+
+# Audit log settings
+audit:
+  hash_algorithm: "sha256"
+  chain_enabled: true
+  redact_api_keys: true
+  max_log_size_mb: 100      # Rotate when audit.log exceeds this size
+  rotation_backup_count: 5  # Keep 5 rotated backups
+
+# Commands that are always auto-approved (no confirmation needed)
+auto_approved_commands:
+  - "ls"
+  - "pwd"
+  - "echo"
+  - "cat"    # read only
+  - "head"
+  - "tail"
+  - "grep"
+  - "find"   # read only
+  - "which"
+  - "whoami"
+  - "date"
+  - "uname"
