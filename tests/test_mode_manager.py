@@ -85,11 +85,18 @@ def test_validate_mode_switch_unknown(manager):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_ram_guard_blocks_gemma26b_when_qwen_loaded(manager):
+async def test_ram_guard_blocks_gemma26b_when_qwen_loaded(manager, monkeypatch):
     """
     Loading gemma4:26b while qwen3.5:27b-q4_K_M is in loaded_models must raise RuntimeError.
     This is the critical RAM safety check — combined = ~34 GB + overhead > 48 GB.
+
+    We monkeypatch get_loaded_models so sync_loaded_models() (GAP 2 fix) returns
+    the state WE control — not real Ollama /api/ps — making the test Ollama-independent.
     """
+    async def mock_get_loaded_models():
+        return ["qwen3.5:27b-q4_K_M"]
+    monkeypatch.setattr(manager, "get_loaded_models", mock_get_loaded_models)
+
     manager.loaded_models.add("qwen3.5:27b-q4_K_M")
     with pytest.raises(RuntimeError) as exc_info:
         await manager._call_ollama(
@@ -102,10 +109,16 @@ async def test_ram_guard_blocks_gemma26b_when_qwen_loaded(manager):
 
 
 @pytest.mark.asyncio
-async def test_ram_guard_blocks_qwen_when_gemma26b_loaded(manager):
+async def test_ram_guard_blocks_qwen_when_gemma26b_loaded(manager, monkeypatch):
     """
     Loading qwen3.5:27b-q4_K_M while gemma4:26b is in loaded_models must raise RuntimeError.
+
+    Same monkeypatch pattern — controls what sync_loaded_models() sees.
     """
+    async def mock_get_loaded_models():
+        return ["gemma4:26b"]
+    monkeypatch.setattr(manager, "get_loaded_models", mock_get_loaded_models)
+
     manager.loaded_models.add("gemma4:26b")
     with pytest.raises(RuntimeError) as exc_info:
         await manager._call_ollama(
