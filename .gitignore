@@ -1,0 +1,45 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# Environment
+.env
+*.env.local
+
+# JARVIS Data (private)
+memory_vault/chroma_db/
+memory_vault/logs/
+sandbox/audit.log
+voice_engine/jarvis_ref.wav
+voice_engine/jarvis_ref_calm.wav
+voice_engine/jarvis_ref_urgent.wav
+voice_engine/jarvis_ref_witty.wav
+
+# Vertex AI credentials
+jarvis_vertex_key.json
+*.json.key
+
+# Ollama models (too large)
+models/
+
+# OS Files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Test artifacts
+.pytest_cache/
+htmlcov/
+.coverage
+
+# Node (Phase 8)
+node_modules/
+package-lock.json

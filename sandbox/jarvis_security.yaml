@@ -1,0 +1,74 @@
+# J.A.R.V.I.S. Security Policy v5.0
+# All commands from all agents pass through sandbox/executor.py
+
+paths:
+  read_write_allowed:
+    - "~/Workspace/"
+    - "~/Projects/"
+    - "~/Downloads/"
+    - "~/Documents/Jarvis/"
+  
+  read_only:
+    - "~/Desktop/"
+  
+  blocked:
+    - "/"
+    - "/etc/"
+    - "/System/"
+    - "/Library/Keychains/"
+    - "~/.ssh/"
+    - "/private/var/"
+    - "~/.env"
+    - "~/.gitconfig"
+
+network:
+  allowed_domains:
+    - "localhost"
+    - "127.0.0.1"
+    - "api.github.com"
+    - "stackoverflow.com"
+    - "pypi.org"
+    - "npmjs.com"
+    - "ollama.com"
+    - "google.com"
+    - "flipkart.com"
+    - "amazon.in"
+    - "huggingface.co"
+    - "vertexai.googleapis.com"
+    - "aiplatform.googleapis.com"
+  blocked_by_default: true
+
+commands:
+  blocked_prefixes:
+    - "sudo"
+    - "su "
+    - "chmod 777"
+    - "rm -rf /"
+    - "dd if="
+    - "mkfs"
+    - "> /dev/"
+    - "curl | bash"
+    - "wget | bash"
+
+confirmations:
+  always_required:
+    - FILE_DELETE
+    - FORM_SUBMIT
+    - PURCHASE
+    - GIT_FORCE_PUSH
+    - NPM_PUBLISH
+    - EMAIL_SEND
+    - SLACK_SEND
+  double_confirmation_required:
+    - FILE_DELETE
+    - PURCHASE
+
+clipboard:
+  access: "explicit_only"
+  policy: "Only access clipboard when user explicitly says 'use what is in my clipboard'"
+
+api_keys:
+  log: false
+  speak: false
+  write_to_memory: false
+  note: "API keys are invisible to all agents. Mode manager handles them."

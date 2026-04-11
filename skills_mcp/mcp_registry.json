@@ -1,0 +1,94 @@
+{
+  "version": "5.0",
+  "last_updated": "2026-04-10",
+  "servers": [
+    {
+      "name": "filesystem",
+      "display_name": "Filesystem MCP",
+      "package": "@modelcontextprotocol/server-filesystem",
+      "install_command": "npm install -g @modelcontextprotocol/server-filesystem",
+      "enabled": false,
+      "status": "not_installed",
+      "description": "Read any file, write any file, list directories, search file contents, create folders, move files.",
+      "agents_allowed": ["orchestrator", "code_specialist", "file_manager", "system_control", "communication"],
+      "notes": "Install in Phase 8. Requires Node.js 18+."
+    },
+    {
+      "name": "puppeteer",
+      "display_name": "Puppeteer Browser MCP",
+      "package": "@modelcontextprotocol/server-puppeteer",
+      "install_command": "npm install -g @modelcontextprotocol/server-puppeteer",
+      "enabled": false,
+      "status": "not_installed",
+      "description": "Headless Chrome browser control. Navigate, click, fill forms, scroll, read DOM.",
+      "agents_allowed": ["browser_shopping", "research"],
+      "notes": "Install in Phase 8. Required for all web automation tasks."
+    },
+    {
+      "name": "github",
+      "display_name": "GitHub MCP",
+      "package": "@modelcontextprotocol/server-github",
+      "install_command": "npm install -g @modelcontextprotocol/server-github",
+      "enabled": false,
+      "status": "not_installed",
+      "description": "Full repository management: read repos, create branches, push commits, open PRs.",
+      "agents_allowed": ["code_specialist", "orchestrator"],
+      "notes": "Requires GITHUB_TOKEN in .env. Install in Phase 8."
+    },
+    {
+      "name": "composio",
+      "display_name": "Composio MCP (500+ Apps)",
+      "package": "composio-mcp",
+      "install_command": "pip install composio-mcp",
+      "enabled": false,
+      "status": "not_installed",
+      "description": "Gmail, Slack, Jira, Notion, Google Calendar, Trello, Asana, Salesforce — 500+ integrations.",
+      "agents_allowed": ["communication", "orchestrator"],
+      "notes": "Requires COMPOSIO_API_KEY in .env. Install in Phase 8."
+    },
+    {
+      "name": "os_control",
+      "display_name": "OS Control MCP",
+      "package": "@modelcontextprotocol/server-os-control",
+      "install_command": "npm install -g @modelcontextprotocol/server-os-control",
+      "enabled": false,
+      "status": "not_installed",
+      "description": "Open apps, adjust volume, check battery, switch spaces, close apps, take screenshots.",
+      "agents_allowed": ["system_control"],
+      "notes": "Platform-specific: AppleScript on macOS, PowerShell on Windows. Install in Phase 8."
+    },
+    {
+      "name": "brave_search",
+      "display_name": "Brave Search MCP",
+      "package": "@modelcontextprotocol/server-brave-search",
+      "install_command": "npm install -g @modelcontextprotocol/server-brave-search",
+      "enabled": false,
+      "status": "not_installed",
+      "description": "Web search without browser automation. Used in offline mode research.",
+      "agents_allowed": ["research", "orchestrator"],
+      "notes": "Requires BRAVE_API_KEY in .env. Free tier available. Install in Phase 8."
+    },
+    {
+      "name": "firecrawl",
+      "display_name": "FireCrawl MCP (Offline Research)",
+      "package": "firecrawl-mcp",
+      "install_command": "pip install firecrawl-mcp",
+      "enabled": false,
+      "status": "not_installed",
+      "description": "Advanced web scraping. Extract structured data, convert pages to Markdown. Offline mode only.",
+      "agents_allowed": ["research"],
+      "notes": "Not needed in online mode (Gemini Search grounding replaces it). Install in Phase 8."
+    },
+    {
+      "name": "pyautogui",
+      "display_name": "PyAutoGUI (Computer Control)",
+      "package": "pyautogui",
+      "install_command": "pip install pyautogui",
+      "enabled": false,
+      "status": "not_installed",
+      "description": "Mouse and keyboard simulation. Wrapped in sandbox executor.",
+      "agents_allowed": ["screen_vision_deep"],
+      "notes": "Installed via pip. All calls go through sandbox/executor.py. Phase 6."
+    }
+  ]
+}

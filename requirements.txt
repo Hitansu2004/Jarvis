@@ -1,0 +1,55 @@
+# Core Framework
+fastapi>=0.115.0
+uvicorn[standard]>=0.34.0
+pydantic>=2.0.0
+python-dotenv>=1.0.0
+httpx>=0.28.0
+
+# Memory
+chromadb>=0.6.0
+sentence-transformers>=3.0.0
+
+# Voice — STT
+openai-whisper>=20240930
+
+# Voice — TTS (install separately if pip fails, see notes)
+# f5-tts>=0.3.0           # pip install f5-tts
+# chatterbox-tts>=0.1.0   # pip install chatterbox-tts
+# kokoro-onnx>=0.4.0      # pip install kokoro-onnx
+
+# Wake Word
+openwakeword>=0.6.0
+
+# Screen Capture
+mss>=9.0.0
+Pillow>=10.0.0
+
+# Computer Control (Phase 6)
+pyautogui>=0.9.54
+
+# Scheduling
+APScheduler>=3.10.0
+
+# Telegram Bot (Phase 10)
+python-telegram-bot>=21.0
+
+# Audio Processing (Voice Clone setup)
+demucs>=4.0.0
+yt-dlp>=2024.1.0
+
+# Vertex AI (Online Mode — optional)
+# google-cloud-aiplatform>=1.70.0
+# vertexai>=1.70.0
+
+# Testing
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
+httpx>=0.28.0   # also used for testing
+
+# macOS Overlay (macOS only)
+# pyobjc-framework-Cocoa>=10.0   # pip install pyobjc-framework-Cocoa
+
+# Utilities
+numpy>=1.26.0
+pyyaml>=6.0.0
+rich>=13.0.0
