@@ -163,17 +163,16 @@ def _get_greeting() -> str:
 
 def _write_audit_log(entry: dict) -> None:
     """
-    Append a JSON-Lines entry to sandbox/audit.log.
+    Append a JSON-Lines entry to sandbox/audit.log via AuditManager.
 
     Args:
-        entry: Dict to serialise as a single JSON line.
+        entry: Dict to serialise and write to the audit chain.
     """
     try:
-        _AUDIT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with _AUDIT_LOG_PATH.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(entry) + "\n")
+        from sandbox.audit_manager import get_audit_manager
+        get_audit_manager().write(entry)
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Failed to write audit log: %s", exc)
+        logger.warning("Failed to write audit log via manager: %s", exc)
 
 
 def _iso_now() -> str:
