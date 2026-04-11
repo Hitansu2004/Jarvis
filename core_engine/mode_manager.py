@@ -84,6 +84,11 @@ class ModeManager:
         # RAM tracker: set of model names currently loaded in Ollama
         self.loaded_models: set[str] = set()
 
+        # GAP 3 FIX: Singleton ComplexityRouter — never instantiate inside complete()
+        # Delayed import to avoid circular dependency (router doesn't import mode_manager)
+        from core_engine.router import ComplexityRouter  # noqa: PLC0415
+        self._router = ComplexityRouter()
+
         logger.info(
             "ModeManager initialised — mode=%s, prototype=%s, ollama=%s",
             self.operation_mode,
@@ -146,10 +151,8 @@ class ModeManager:
                 self._speak_fallback_notice()
                 # Fall through to offline
 
-        # Offline path
-        from core_engine.router import ComplexityRouter  # lazy import to avoid circular
-        router = ComplexityRouter()
-        model = router.get_offline_model(agent_name, complexity_score)
+        # Offline path — GAP 3 FIX: use singleton self._router, not a new instance
+        model = self._router.get_offline_model(agent_name, complexity_score)
         return await self._call_ollama(
             model=model,
             system_prompt=system_prompt,
@@ -157,11 +160,26 @@ class ModeManager:
             images=images,
             temperature=temperature,
             max_tokens=max_tokens,
+            agent_name=agent_name,
         )
 
     # ------------------------------------------------------------------
     # Private: Ollama backend
     # ------------------------------------------------------------------
+
+    async def sync_loaded_models(self) -> None:
+        """
+        GAP 2 FIX: Synchronise self.loaded_models from actual Ollama /api/ps state.
+
+        Called before every RAM guard check so the guard reflects reality,
+        not stale in-memory state from a previous server session.
+        Silently falls back to cached state if Ollama is unreachable.
+        """
+        try:
+            actual = await self.get_loaded_models()
+            self.loaded_models = set(actual)
+        except Exception:  # noqa: BLE001
+            pass  # use cached set if Ollama is unreachable
 
     async def _call_ollama(
         self,
@@ -171,6 +189,7 @@ class ModeManager:
         images: Optional[list[bytes]] = None,
         temperature: float = 0.7,
         max_tokens: int = 2048,
+        agent_name: str = "",
     ) -> dict:
         """
         Make an async call to the local Ollama /api/chat endpoint.
@@ -192,6 +211,9 @@ class ModeManager:
         Raises:
             RuntimeError: If RAM guard detects both large models would be loaded.
         """
+        # ---- GAP 2 FIX: Sync from actual Ollama state before RAM guard ----
+        await self.sync_loaded_models()
+
         # ---- CRITICAL RAM GUARD ----
         if model == self._LARGE_MODEL_A and self._LARGE_MODEL_B in self.loaded_models:
             raise RuntimeError(
@@ -241,6 +263,26 @@ class ModeManager:
 
             # Track loaded model for RAM guard
             self.loaded_models.add(model)
+
+            # GAP 9 FIX: If agent has keep_alive_offline=0, Ollama will auto-unload
+            # after the response — reflect that in our in-memory set immediately
+            if agent_name:
+                try:
+                    from core_engine.agent_registry import AgentRegistry  # noqa: PLC0415
+                    # Use a lightweight path lookup — don't instantiate a full registry
+                    import json
+                    from pathlib import Path as _Path
+                    _agents_path = _Path(__file__).parent / "agents.json"
+                    _agents_data = json.loads(_agents_path.read_text(encoding="utf-8"))
+                    _agent = next((a for a in _agents_data if a.get("name") == agent_name), None)
+                    if _agent and _agent.get("keep_alive_offline", -1) == 0:
+                        self.loaded_models.discard(model)
+                        logger.debug(
+                            "keep_alive=0 agent '%s': removed '%s' from loaded_models.",
+                            agent_name, model,
+                        )
+                except Exception:  # noqa: BLE001
+                    pass  # Non-critical — RAM guard still works via sync_loaded_models
 
             return {
                 "content": content,

@@ -420,6 +420,10 @@ async def chat(request: ChatRequest):
     # Step 3: Build system prompt (JARVIS_CORE.md prepended inside get_system_prompt)
     system_prompt = _registry.get_system_prompt(recommended_agent)
 
+    # Read per-agent temperature from registry (code_specialist=0.1, auditor=0.1, etc.)
+    agent_def = _registry.get_agent(recommended_agent)
+    agent_temperature: float = agent_def.get("temperature", 0.7) if agent_def else 0.7
+
     # Append any user-supplied context
     user_message = request.message
     if context_str:
@@ -432,6 +436,7 @@ async def chat(request: ChatRequest):
             system_prompt=system_prompt,
             user_message=user_message,
             complexity_score=score,
+            temperature=agent_temperature,   # ← FIX 1: use per-agent temperature
         )
     finally:
         # Restore original mode if it was overridden for this request

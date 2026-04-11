@@ -74,6 +74,10 @@ class Executor:
     Checks every command against the security policy before execution.
     Logs all actions (approved, rejected, pending) to audit.log.
 
+    GAP 4 FIX: Real 2-step double confirmation implemented.
+    _pending_confirmations now tracks confirmations_received and required_confirmations.
+    The confirm() method increments the counter and executes when satisfied.
+
     Phase 2 will add full network and path enforcement.
     Phase 1 provides the correct interface and blocking for the most
     critical security rules (blocked_prefixes, double-confirmation).
@@ -82,6 +86,9 @@ class Executor:
     def __init__(self) -> None:
         """Load the security policy on initialisation."""
         self.policy: dict = _load_policy()
+        # GAP 4 FIX: Each pending action now tracks confirmation stage
+        # Structure: { confirmation_key: { command, agent_name, action_type,
+        #              confirmations_received, required_confirmations } }
         self._pending_confirmations: dict[str, dict] = {}
 
     def execute(
@@ -102,7 +109,7 @@ class Executor:
 
         Returns:
             dict with status ("success"|"failed"|"rejected"|"needs_confirmation"),
-            output (str), error (str|None).
+            output (str), error (str|None), and confirmation_key (str, if pending).
         """
         # --- Step 1: Check blocked command prefixes ---
         blocked_prefixes = self.policy.get("commands", {}).get("blocked_prefixes", [])
@@ -144,12 +151,19 @@ class Executor:
         double_required: list[str] = self.policy.get("confirmations", {}).get("double_confirmation_required", [])
 
         if action_type in always_required and not confirmed:
+            # GAP 4 FIX: Track required vs received confirmations per action
+            required_count = 2 if action_type in double_required else 1
             confirmation_key = f"{agent_name}:{action_type}:{hash(command)}"
+
+            # Store pending action with staged confirmation tracking
             self._pending_confirmations[confirmation_key] = {
                 "command": command,
                 "agent_name": agent_name,
                 "action_type": action_type,
+                "confirmations_received": 0,         # ← track count
+                "required_confirmations": required_count,
             }
+
             _write_audit({
                 "timestamp": _iso_now(),
                 "agent_name": agent_name,
@@ -160,19 +174,27 @@ class Executor:
                 "outcome": "PARTIAL",
                 "error_message": None,
             })
-            msg = (
-                f"This action requires your confirmation, Sir: {action_type}.\n"
-                f"Command: {command[:120]}\n"
-                "Please confirm to proceed."
-            )
+
             if action_type in double_required:
                 msg = (
                     f"⚠️  DOUBLE CONFIRMATION REQUIRED for {action_type}, Sir.\n"
                     f"Command: {command[:120]}\n"
-                    "This action is irreversible. Please confirm TWICE to proceed."
+                    "This action is irreversible. Please confirm TWICE to proceed.\n"
+                    f"Confirmation key: {confirmation_key}"
                 )
+            else:
+                msg = (
+                    f"This action requires your confirmation, Sir: {action_type}.\n"
+                    f"Command: {command[:120]}\n"
+                    "Please confirm to proceed.\n"
+                    f"Confirmation key: {confirmation_key}"
+                )
+
             return {
                 "status": "needs_confirmation",
+                "confirmation_key": confirmation_key,   # ← caller must send this back
+                "confirmations_received": 0,
+                "required_confirmations": required_count,
                 "command": command,
                 "message": msg,
                 "error": None,
@@ -238,3 +260,93 @@ class Executor:
             error_msg = str(exc)
             logger.error("Executor error: %s", error_msg)
             return {"status": "failed", "output": "", "error": error_msg}
+
+    def confirm(self, confirmation_key: str) -> dict:
+        """
+        GAP 4 FIX: Submit one confirmation step for a pending action.
+
+        For single-confirmation actions, one call executes the command.
+        For double-confirmation actions (FILE_DELETE, PURCHASE), two calls are needed.
+
+        Args:
+            confirmation_key: The key returned in the needs_confirmation response.
+
+        Returns:
+            dict — either another needs_confirmation (if more steps required),
+            or the final execution result dict.
+        """
+        pending = self._pending_confirmations.get(confirmation_key)
+        if not pending:
+            return {
+                "status": "failed",
+                "output": "",
+                "error": f"No pending action found for key '{confirmation_key}'. It may have already been executed or cancelled.",
+            }
+
+        pending["confirmations_received"] += 1
+        received = pending["confirmations_received"]
+        required = pending["required_confirmations"]
+
+        _write_audit({
+            "timestamp": _iso_now(),
+            "agent_name": pending["agent_name"],
+            "model_used": "none",
+            "action_type": pending["action_type"],
+            "command_or_url": pending["command"][:200],
+            "confirmation_status": f"CONFIRMED_{received}_OF_{required}",
+            "outcome": "PARTIAL" if received < required else "SUCCESS",
+            "error_message": None,
+        })
+
+        if received < required:
+            # More confirmations needed — return intermediate state
+            remaining = required - received
+            return {
+                "status": "needs_confirmation",
+                "confirmation_key": confirmation_key,
+                "confirmations_received": received,
+                "required_confirmations": required,
+                "message": (
+                    f"Confirmation {received} of {required} received, Sir. "
+                    f"Please confirm {remaining} more time(s) to proceed.\n"
+                    f"Action: {pending['action_type']} — {pending['command'][:80]}"
+                ),
+                "error": None,
+            }
+
+        # All confirmations received — execute the command
+        cmd = pending.pop("command")
+        agent = pending.pop("agent_name")
+        atype = pending.pop("action_type")
+        del self._pending_confirmations[confirmation_key]
+
+        logger.info(
+            "Double confirmation satisfied (%d/%d) for %s — executing: %s",
+            received, required, atype, cmd[:80],
+        )
+        return self.execute(command=cmd, action_type=atype, agent_name=agent, confirmed=True)
+
+    def cancel(self, confirmation_key: str) -> dict:
+        """
+        Cancel a pending confirmation.
+
+        Args:
+            confirmation_key: The key of the pending action to cancel.
+
+        Returns:
+            dict with status "cancelled" or "not_found".
+        """
+        if confirmation_key in self._pending_confirmations:
+            pending = self._pending_confirmations.pop(confirmation_key)
+            _write_audit({
+                "timestamp": _iso_now(),
+                "agent_name": pending.get("agent_name", "unknown"),
+                "model_used": "none",
+                "action_type": pending.get("action_type", "unknown"),
+                "command_or_url": pending.get("command", "")[:200],
+                "confirmation_status": "CANCELLED",
+                "outcome": "FAILURE",
+                "error_message": "User cancelled the action.",
+            })
+            return {"status": "cancelled", "message": f"Action cancelled, Sir. Key: {confirmation_key}"}
+        return {"status": "not_found", "error": f"No pending action found for key '{confirmation_key}'."}
