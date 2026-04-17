@@ -8,6 +8,7 @@ Phase 1 — Blueprint v5.0
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -49,6 +50,10 @@ from core_engine.mode_manager import ModeManager, get_mode_manager
 from core_engine.router import ComplexityRouter
 from sandbox.security_enforcer import SecurityEnforcer, get_security_enforcer
 from sandbox.audit_manager import AuditManager, get_audit_manager
+from voice_engine.tts import get_tts_engine, TTSEngine
+from voice_engine.stt import get_stt_engine, STTEngine
+from voice_engine.wake_word import get_wake_word_detector, WakeWordDetector
+from voice_engine.voice_session import get_voice_session_manager, VoiceSessionManager
 
 # ---------------------------------------------------------------------------
 # Paths & constants
@@ -65,6 +70,9 @@ _router: Optional[ComplexityRouter] = None
 _mode_manager: Optional[ModeManager] = None
 _security_enforcer: Optional[SecurityEnforcer] = None
 _audit: Optional[AuditManager] = None
+_voice_session: Optional[VoiceSessionManager] = None
+_tts_engine: Optional[TTSEngine] = None
+_stt_engine: Optional[STTEngine] = None
 
 
 # ===========================================================================
@@ -142,6 +150,18 @@ class SpecSheet(BaseModel):
 class SecurityConfirmRequest(BaseModel):
     confirmation_key: str
 
+class VoiceSpeakRequest(BaseModel):
+    text: str
+    language: str = "en"
+    urgent: bool = False
+
+class VoiceListenRequest(BaseModel):
+    duration_seconds: float = 5.0
+    language: Optional[str] = None
+
+class SuppressRequest(BaseModel):
+    seconds: int = 120
+
 # ===========================================================================
 # Helper utilities
 # ===========================================================================
@@ -198,7 +218,7 @@ async def lifespan(app: FastAPI):
     - Initialises singletons (AgentRegistry, ComplexityRouter, ModeManager)
     - Prints JARVIS boot message
     """
-    global _registry, _router, _mode_manager, _security_enforcer, _audit
+    global _registry, _router, _mode_manager, _security_enforcer, _audit, _voice_session, _tts_engine, _stt_engine
 
     import asyncio
 
@@ -217,6 +237,47 @@ async def lifespan(app: FastAPI):
     _mode_manager = get_mode_manager()
     _security_enforcer = get_security_enforcer()
     _audit = get_audit_manager()
+
+    # Initialize voice engines
+    _tts_engine = get_tts_engine()
+    _stt_engine = get_stt_engine()
+
+    # Wire voice session callback to gateway chat pipeline
+    _voice_session = get_voice_session_manager()
+
+    async def _voice_transcription_callback(text: str, session_id: str):
+        """Called when wake word + STT produces a transcribed command."""
+        _write_audit_log({
+            "timestamp": _iso_now(),
+            "agent_name": "voice_triage",
+            "model_used": "whisper-small",
+            "action_type": "VOICE_COMMAND",
+            "command_or_url": f"VOICE: {text[:100]}",
+            "confirmation_status": "AUTO_APPROVED",
+            "outcome": "SUCCESS",
+            "error_message": None,
+        })
+        logger.info("Voice command received [%s]: '%s'", session_id, text[:80])
+        
+        classification = _router.classify(text)
+        system_prompt = _registry.get_system_prompt(classification["recommended_agent"])
+        try:
+            result = await _mode_manager.complete(
+                agent_name=classification["recommended_agent"],
+                system_prompt=system_prompt,
+                user_message=text,
+                complexity_score=classification["score"],
+            )
+            response_text = result.get("content", "")
+            if response_text:
+                await _voice_session.speak_response(response_text)
+        except Exception as e:
+            logger.error("Voice command processing failed: %s", e)
+            await _voice_session.speak_immediately("I encountered an error processing that command, Sir.")
+
+    _voice_session.set_transcription_callback(_voice_transcription_callback)
+    _voice_session.start()
+    logger.info("Voice session manager started.")
 
     async def cleanup_loop():
         while True:
@@ -395,7 +456,7 @@ async def reload_agents():
 
 
 @app.post("/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest):
+async def chat(request: ChatRequest, speak: bool = False):
     """
     Primary chat endpoint — all user messages enter here.
 
@@ -472,8 +533,12 @@ async def chat(request: ChatRequest):
         "error_message": None,
     })
 
+    response_text = result.get("content", "")
+    if speak and response_text:
+        await _voice_session.speak_response(response_text)
+
     return ChatResponse(
-        response=result.get("content", ""),
+        response=response_text,
         agent_used=recommended_agent,
         model_used=result.get("model_used", "unknown"),
         complexity_score=score,
@@ -632,3 +697,63 @@ async def security_violations(since_hours: int = 24):
     violations = _audit.get_violations(since_hours=since_hours)
     return {"violations": violations, "count": len(violations)}
 
+# ===========================================================================
+# Phase 3 — Voice Routes
+# ===========================================================================
+
+@app.post("/voice/speak")
+async def voice_speak(request: VoiceSpeakRequest):
+    if not request.text or not request.text.strip():
+        raise HTTPException(status_code=422, detail="Text cannot be empty.")
+    
+    _write_audit_log({
+        "timestamp": _iso_now(),
+        "agent_name": "gateway.voice",
+        "model_used": "none",
+        "action_type": "VOICE_COMMAND",
+        "command_or_url": f"TTS: {request.text[:100]}",
+        "confirmation_status": "AUTO_APPROVED",
+        "outcome": "SUCCESS",
+        "error_message": None,
+    })
+    
+    spoken = await _tts_engine.speak(request.text, request.language, request.urgent)
+    return {"spoken": spoken, "engine_used": _tts_engine.get_status()["active_engine"], "text": request.text}
+
+@app.post("/voice/listen")
+async def voice_listen(request: VoiceListenRequest):
+    _write_audit_log({
+        "timestamp": _iso_now(),
+        "agent_name": "gateway.voice",
+        "model_used": "whisper",
+        "action_type": "VOICE_COMMAND",
+        "command_or_url": "STT manual listen",
+        "confirmation_status": "AUTO_APPROVED",
+        "outcome": "SUCCESS",
+        "error_message": None,
+    })
+    text = await _stt_engine.record_and_transcribe(request.duration_seconds, request.language)
+    return {"text": text, "language_detected": request.language or "auto", "duration": request.duration_seconds}
+
+@app.post("/voice/wake")
+async def voice_wake():
+    loop = asyncio.get_event_loop()
+    asyncio.run_coroutine_threadsafe(_voice_session._handle_voice_command(), loop)
+    return {"status": "wake_triggered", "session_id": _voice_session._current_session_id or str(uuid.uuid4())}
+
+@app.post("/voice/suppress")
+async def voice_suppress(request: SuppressRequest):
+    _voice_session.suppress_suggestions(request.seconds)
+    await _voice_session.speak_immediately("Understood, Sir. I will hold my suggestions for now.")
+    return {"status": "suppressed", "seconds": request.seconds, "until": _iso_now()}
+
+@app.get("/voice/suppressed")
+async def voice_suppressed():
+    suggestions = _voice_session.get_suppressed_suggestions()
+    if suggestions:
+        await _voice_session.speak_immediately("Sir, I noticed several things while I was quiet — shall I share them?")
+    return {"suggestions": suggestions, "count": len(suggestions)}
+
+@app.get("/voice/status")
+async def voice_status():
+    return _voice_session.get_status()

@@ -1,107 +1,199 @@
 """
 J.A.R.V.I.S. — voice_engine/wake_word.py
-Wake word detection stub using openWakeWord. Full implementation in Phase 3.
+Always-on wake word detection using openWakeWord.
+Listens for "Hey Jarvis" at ~0.5% CPU usage continuously.
+On detection: triggers STT recording and agent pipeline.
 
 Author: Hitansu Parichha | Nisum Technologies
-Phase 1 — Blueprint v5.0
+Phase 3 — Blueprint v5.0
 """
-
-from __future__ import annotations
 
 import logging
 import os
 import threading
+import time
 from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
 
-
 class WakeWordDetector:
-    """
-    Always-on wake word detector for J.A.R.V.I.S.
-
-    Uses openWakeWord (~0.5% CPU) to listen for "Hey Jarvis".
-    Phase 1 stub: logs startup message if openWakeWord is unavailable.
-    Phase 3 will activate full audio stream detection.
-    """
-
     def __init__(self, callback: Callable[[], None]) -> None:
-        """
-        Initialise the wake word detector.
-
-        Args:
-            callback: Zero-argument callable invoked when the wake word is detected.
-                      The gateway passes a function that triggers voice processing.
-        """
-        self.wake_word: str = os.getenv("WAKE_WORD", "Hey Jarvis")
         self.callback = callback
+        self.wake_word = os.environ.get("WAKE_WORD", "Hey Jarvis")
+        self._detection_threshold = float(os.environ.get("WAKE_WORD_THRESHOLD", "0.5"))
+        
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._oww_available = False
-        self._try_import_oww()
+        self._oww_model = None
+        
+        self._chunk_size = 1280
+        self._sample_rate = 16000
+        self._cooldown_seconds = 2.0
+        self._last_detection = 0.0
+        
+        # Test availability without fully loading inference engines
+        try:
+            import openwakeword
+        except ImportError:
+            pass
+            
+        logger.info(
+            "WakeWordDetector initialized — threshold=%.2f, word='%s'",
+            self._detection_threshold, self.wake_word
+        )
 
-    def _try_import_oww(self) -> None:
+    def _try_init_oww(self) -> bool:
         """
-        Attempt to import openWakeWord.
-
-        Logs a warning if not installed so the server continues without crashing.
+        Initialize openWakeWord model for "Hey Jarvis" detection.
+        Called when start() is invoked, not in __init__ (lazy init).
         """
         try:
-            import openwakeword  # noqa: F401
-            self._oww_available = True
-            logger.info("openWakeWord available — wake word: '%s'.", self.wake_word)
+            from openwakeword.model import Model
+            try:
+                self._oww_model = Model(
+                    wakeword_models=["hey_jarvis"],
+                    inference_framework="onnx"
+                )
+                logger.info("openWakeWord loaded — listening for '%s'", self.wake_word)
+                self._oww_available = True
+                return True
+            except Exception:
+                logger.warning(
+                    "openWakeWord 'hey_jarvis' model not found. "
+                    "Run: python3 -m openwakeword.train to create a custom model. "
+                    "Wake word detection will be SIMULATED in Phase 3."
+                )
+                self._oww_available = False
+                return False
         except ImportError:
-            logger.warning(
-                "openWakeWord not installed — wake word detection disabled. "
-                "Install with: pip install openwakeword"
-            )
+            logger.warning("openwakeword not installed. Wake word detection unavailable.")
+            self._oww_available = False
+            return False
 
     def start(self) -> None:
         """
         Start the background wake word detection thread.
-
-        CPU usage: ~0.5% with openWakeWord.
-        Phase 1: prints a stub message. Phase 3 will activate audio stream.
+        If openWakeWord is not available, starts a SIMULATION thread instead.
         """
         if self._running:
-            logger.warning("Wake word detector already running.")
+            logger.warning("WakeWordDetector already running.")
             return
 
         self._running = True
+        oww_ready = self._try_init_oww()
 
-        if not self._oww_available:
-            print("[JARVIS]: Wake word detector started (stub) — openWakeWord not installed.")
-            logger.info("Wake word detector stub started — '%s' not active.", self.wake_word)
-            return
+        if oww_ready:
+            self._thread = threading.Thread(
+                target=self._detection_loop,
+                name="JarvisWakeWordDetector",
+                daemon=True
+            )
+        else:
+            self._thread = threading.Thread(
+                target=self._simulation_loop,
+                name="JarvisWakeWordSimulator",
+                daemon=True
+            )
 
-        self._thread = threading.Thread(
-            target=self._detection_loop,
-            daemon=True,
-            name="jarvis-wake-word",
-        )
         self._thread.start()
-        logger.info("Wake word detector thread started — listening for '%s'.", self.wake_word)
-
-    def stop(self) -> None:
-        """
-        Stop the background wake word detection thread.
-        """
-        self._running = False
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=2.0)
-        logger.info("Wake word detector stopped.")
+        logger.info(
+            "Wake word detector started (%s mode).",
+            "real" if oww_ready else "simulation"
+        )
 
     def _detection_loop(self) -> None:
         """
-        Background detection loop. Phase 3 will wire this to a real audio stream.
-
-        Currently a no-op loop waiting for Phase 3 implementation.
+        Real openWakeWord detection loop.
+        Reads from microphone in chunks, feeds to OWW model,
+        triggers callback on detection above threshold.
         """
-        # Phase 3 implementation:
-        # 1. Open pyaudio stream at 16 kHz mono
-        # 2. Feed chunks to openwakeword model
-        # 3. When activation score > threshold: call self.callback()
-        logger.info("Wake word detection loop running (Phase 3 will activate audio stream).")
+        try:
+            import sounddevice as sd
+            import numpy as np
+
+            with sd.InputStream(
+                samplerate=self._sample_rate,
+                channels=1,
+                dtype="int16",
+                blocksize=self._chunk_size,
+            ) as stream:
+                logger.info("Microphone open — listening for '%s'...", self.wake_word)
+                while self._running:
+                    audio_chunk, _ = stream.read(self._chunk_size)
+                    audio_flat = audio_chunk.flatten()
+
+                    # Feed to openWakeWord
+                    prediction = self._oww_model.predict(audio_flat)
+
+                    # Check scores for all detected wakewords
+                    for model_name, score in prediction.items():
+                        if score > self._detection_threshold:
+                            now = time.time()
+                            if now - self._last_detection > self._cooldown_seconds:
+                                self._last_detection = now
+                                logger.info(
+                                    "Wake word detected! model=%s score=%.3f",
+                                    model_name, score
+                                )
+                                threading.Thread(
+                                    target=self.callback,
+                                    daemon=True,
+                                    name="WakeWordCallback"
+                                ).start()
+                                
+        except ImportError:
+            logger.error("sounddevice not available — microphone detection failed.")
+        except Exception as e:
+            logger.error("Wake word detection loop error: %s", e)
+            self._running = False
+
+    def _simulation_loop(self) -> None:
+        """
+        Simulation loop when openWakeWord is not available.
+        Logs instructions every 30 seconds.
+        """
+        count = 0
         while self._running:
-            import time
-            time.sleep(1)  # idle — Phase 3 will replace with audio processing
+            time.sleep(30)
+            count += 1
+            if count == 1:
+                logger.info(
+                    "Wake word SIMULATION active. "
+                    "Trigger manually: POST http://localhost:8000/voice/wake "
+                    "Or say 'Hey Jarvis' via: POST /voice/listen"
+                )
+
+    def stop(self) -> None:
+        """Stop the wake word detection thread."""
+        self._running = False
+        if self._thread and self._thread.is_alive():
+            try:
+                # Use a very short join so tests don't hang if time.sleep is blocking
+                # The prompt asks for 2.0 second timeout. We might use 0.1 for faster tests but let's stick to 2.0.
+                self._thread.join(timeout=2.0)
+            except RuntimeError:
+                pass
+        logger.info("Wake word detector stopped.")
+
+    def get_status(self) -> dict:
+        """Return wake word detector status."""
+        return {
+            "running": self._running,
+            "oww_available": self._oww_available,
+            "mode": "real" if self._oww_available else "simulation",
+            "wake_word": self.wake_word,
+            "detection_threshold": self._detection_threshold,
+            "cooldown_seconds": self._cooldown_seconds,
+        }
+
+_instance: Optional[WakeWordDetector] = None
+
+def get_wake_word_detector(callback: Callable = None) -> WakeWordDetector:
+    global _instance
+    if _instance is None:
+        if callback is None:
+            def noop_callback(): pass
+            callback = noop_callback
+        _instance = WakeWordDetector(callback)
+    return _instance
