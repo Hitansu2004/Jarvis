@@ -246,7 +246,11 @@ async def lifespan(app: FastAPI):
     _voice_session = get_voice_session_manager()
 
     async def _voice_transcription_callback(text: str, session_id: str):
-        """Called when wake word + STT produces a transcribed command."""
+        """
+        Called when wake word + STT produces a transcribed command.
+        Passes text directly to LLM — no translation needed, Gemma4 is multilingual.
+        Language detection is only used to select the right TTS voice.
+        """
         _write_audit_log({
             "timestamp": _iso_now(),
             "agent_name": "voice_triage",
@@ -257,10 +261,27 @@ async def lifespan(app: FastAPI):
             "outcome": "SUCCESS",
             "error_message": None,
         })
-        logger.info("Voice command received [%s]: '%s'", session_id, text[:80])
-        
+
+        # Terminal display — always show what was heard
+        print(f"\n{'─'*60}")
+        print(f"🎤 YOU  : {text}")
+        print(f"{'─'*60}")
+
+        tts_language = "auto" # Always auto-detect voice based on LLM response text, not input text
+
+        logger.info("Voice command [%s]: '%s'", session_id, text[:80])
+
         classification = _router.classify(text)
         system_prompt = _registry.get_system_prompt(classification["recommended_agent"])
+        system_prompt += (
+            "\n\n[VOICE MODE RULES]\n"
+            "1. No markdown (no **, *, #, bullets).\n"
+            "2. Keep it very short (max 2-3 sentences).\n"
+            "3. Say 'Jarvis', not 'J.A.R.V.I.S.'.\n"
+            "4. CRITICAL: If you respond in Hindi, you MUST write in the DEVANAGARI script (e.g., नमस्ते). "
+            "Never use Roman/Latin script for Hindi (e.g., namaste) because the text-to-speech engine cannot pronounce it."
+        )
+
         try:
             result = await _mode_manager.complete(
                 agent_name=classification["recommended_agent"],
@@ -269,11 +290,19 @@ async def lifespan(app: FastAPI):
                 complexity_score=classification["score"],
             )
             response_text = result.get("content", "")
-            if response_text:
-                await _voice_session.speak_response(response_text)
+            if not response_text:
+                return
+
+            print(f"🤖 JARVIS: {response_text}")
+            print(f"{'─'*60}\n")
+            await _voice_session.speak_response(response_text, language=tts_language)
+
         except Exception as e:
             logger.error("Voice command processing failed: %s", e)
             await _voice_session.speak_immediately("I encountered an error processing that command, Sir.")
+
+
+
 
     _voice_session.set_transcription_callback(_voice_transcription_callback)
     _voice_session.start()
@@ -738,7 +767,7 @@ async def voice_listen(request: VoiceListenRequest):
 @app.post("/voice/wake")
 async def voice_wake():
     loop = asyncio.get_event_loop()
-    asyncio.run_coroutine_threadsafe(_voice_session._handle_voice_command(), loop)
+    asyncio.run_coroutine_threadsafe(_voice_session._handle_voice_session(), loop)
     return {"status": "wake_triggered", "session_id": _voice_session._current_session_id or str(uuid.uuid4())}
 
 @app.post("/voice/suppress")

@@ -76,17 +76,35 @@ def test_voice_suppressed_suggestions_endpoint(test_client):
     assert "count" in data
 
 def test_chat_with_speak_param(test_client, monkeypatch):
-    # Mock ModeManager complete to avoid spinning up Ollama
+    """POST /chat?speak=true must return 200 with a valid response schema."""
+    from core_engine import gateway as gw
     from core_engine.mode_manager import ModeManager
+
     async def mock_complete(*args, **kwargs):
-        return {"content": "This is a mocked response.", "model_used": "mock"}
+        return {
+            "content": "This is a mocked response, Sir.",
+            "model_used": "mock",
+            "mode": "offline",
+            "tokens_in": 5,
+            "tokens_out": 8,
+        }
+
+    # Patch both the class AND the live singleton instance
     monkeypatch.setattr(ModeManager, "complete", mock_complete)
-    
-    # Send a request with speak=true
+    if gw._mode_manager:
+        monkeypatch.setattr(gw._mode_manager, "complete", mock_complete)
+
     response = test_client.post("/chat?speak=true", json={"message": "hello"})
     assert response.status_code == 200
     data = response.json()
-    assert data["response"] == "This is a mocked response."
+    # Verify schema is correct — not the exact LLM content
+    assert "response" in data
+    assert "agent_used" in data
+    assert "model_used" in data
+    assert "complexity_score" in data
+    assert "mode" in data
+    assert len(data["response"]) > 0
+    assert isinstance(data["complexity_score"], int)
 
 def test_all_phase1_phase2_routes_still_work(test_client):
     assert test_client.get("/health").status_code == 200

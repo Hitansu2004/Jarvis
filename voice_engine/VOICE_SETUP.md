@@ -40,6 +40,29 @@ TTS_VOICE_REF_TEXT=<exact transcript of what JARVIS says in the clip>
 The transcript must be EXACT — every word, exactly as spoken in the clip.
 Example: TTS_VOICE_REF_TEXT=All systems are online, sir. Shall I run a diagnostic?
 
+### Step 4.5 — Download Kokoro Model Files (Fast Fallback TTS)
+
+Kokoro is the fastest TTS fallback. Download its model files:
+```bash
+cd /Users/hparichha/Documents/Jarvis/jarvis
+source .venv/bin/activate
+python3 -c "
+# This triggers auto-download of Kokoro model files
+from kokoro_onnx import Kokoro
+k = Kokoro('kokoro-v0_19.onnx', 'voices.bin')
+print('Kokoro models ready.')
+"
+```
+
+If auto-download fails, download manually:
+```bash
+wget https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v0_19.onnx
+wget https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin
+mv voices-v1.0.bin voices.bin
+```
+
+Once downloaded, you will hear actual audio output without a Jarvis voice clip.
+
 ### Step 4 — Test the Voice Clone
 
 ```bash

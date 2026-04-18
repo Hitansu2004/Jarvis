@@ -21,6 +21,8 @@ voice_engine/jarvis_ref.wav
 voice_engine/jarvis_ref_calm.wav
 voice_engine/jarvis_ref_urgent.wav
 voice_engine/jarvis_ref_witty.wav
+voice_engine/audio_output/*.wav
+voice_engine/audio_output/*.mp3
 
 # Vertex AI credentials
 jarvis_vertex_key.json
@@ -43,3 +45,7 @@ htmlcov/
 # Node (Phase 8)
 node_modules/
 package-lock.json
+
+# Kokoro models (too large)
+*.onnx
+*.bin

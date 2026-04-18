@@ -23,6 +23,7 @@ class WakeWordDetector:
         self._detection_threshold = float(os.environ.get("WAKE_WORD_THRESHOLD", "0.5"))
         
         self._running = False
+        self._paused = False
         self._thread: Optional[threading.Thread] = None
         self._oww_available = False
         self._oww_model = None
@@ -102,46 +103,66 @@ class WakeWordDetector:
             "real" if oww_ready else "simulation"
         )
 
+    def pause(self) -> None:
+        """Pause mic listening so STT VAD can open its own InputStream."""
+        self._paused = True
+
+    def resume(self) -> None:
+        """Resume mic listening after STT VAD is done."""
+        self._paused = False
+
     def _detection_loop(self) -> None:
         """
         Real openWakeWord detection loop.
         Reads from microphone in chunks, feeds to OWW model,
         triggers callback on detection above threshold.
+        Supports pause/resume so STT can take over the mic without conflict.
         """
         try:
             import sounddevice as sd
             import numpy as np
 
-            with sd.InputStream(
-                samplerate=self._sample_rate,
-                channels=1,
-                dtype="int16",
-                blocksize=self._chunk_size,
-            ) as stream:
-                logger.info("Microphone open — listening for '%s'...", self.wake_word)
-                while self._running:
-                    audio_chunk, _ = stream.read(self._chunk_size)
-                    audio_flat = audio_chunk.flatten()
+            while self._running:
+                # If paused, yield mic and wait
+                if self._paused:
+                    import time as _t
+                    _t.sleep(0.1)
+                    continue
 
-                    # Feed to openWakeWord
-                    prediction = self._oww_model.predict(audio_flat)
+                try:
+                    with sd.InputStream(
+                        samplerate=self._sample_rate,
+                        channels=1,
+                        dtype="int16",
+                        blocksize=self._chunk_size,
+                    ) as stream:
+                        logger.info("Microphone open — listening for '%s'...", self.wake_word)
+                        while self._running and not self._paused:
+                            audio_chunk, _ = stream.read(self._chunk_size)
+                            audio_flat = audio_chunk.flatten()
 
-                    # Check scores for all detected wakewords
-                    for model_name, score in prediction.items():
-                        if score > self._detection_threshold:
-                            now = time.time()
-                            if now - self._last_detection > self._cooldown_seconds:
-                                self._last_detection = now
-                                logger.info(
-                                    "Wake word detected! model=%s score=%.3f",
-                                    model_name, score
-                                )
-                                threading.Thread(
-                                    target=self.callback,
-                                    daemon=True,
-                                    name="WakeWordCallback"
-                                ).start()
-                                
+                            prediction = self._oww_model.predict(audio_flat)
+                            for model_name, score in prediction.items():
+                                if score > self._detection_threshold:
+                                    now = time.time()
+                                    if now - self._last_detection > self._cooldown_seconds:
+                                        self._last_detection = now
+                                        logger.info(
+                                            "Wake word detected! model=%s score=%.3f",
+                                            model_name, score
+                                        )
+                                        threading.Thread(
+                                            target=self.callback,
+                                            daemon=True,
+                                            name="WakeWordCallback"
+                                        ).start()
+
+                except Exception as e:
+                    if self._running and not self._paused:
+                        logger.error("Wake word detection error: %s", e)
+                    import time as _t
+                    _t.sleep(0.5)
+
         except ImportError:
             logger.error("sounddevice not available — microphone detection failed.")
         except Exception as e:

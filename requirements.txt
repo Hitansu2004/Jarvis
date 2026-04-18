@@ -53,3 +53,6 @@ httpx>=0.28.0   # also used for testing
 numpy>=1.26.0
 pyyaml>=6.0.0
 rich>=13.0.0
+
+sounddevice>=0.4.6
+soundfile>=0.12.1

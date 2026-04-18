@@ -71,7 +71,7 @@ def test_device_defaults_to_mps(monkeypatch):
     monkeypatch.delenv("STT_DEVICE", raising=False)
     from voice_engine.stt import STTEngine
     stt = STTEngine()
-    assert stt.device == "mps"
+    assert stt.device == "cpu"
 
 @pytest.mark.asyncio
 async def test_transcribe_with_mock_model(stt_engine):

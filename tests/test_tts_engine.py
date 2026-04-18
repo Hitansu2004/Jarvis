@@ -20,10 +20,6 @@ def tts_engine(monkeypatch, tmp_path):
     
     # Mock libraries to be absent, triggering graceful fallbacks.
     monkeypatch.setitem(sys.modules, 'kokoro_onnx', None)
-    monkeypatch.setitem(sys.modules, 'f5_tts', None)
-    monkeypatch.setitem(sys.modules, 'f5_tts.api', None)
-    monkeypatch.setitem(sys.modules, 'chatterbox', None)
-    monkeypatch.setitem(sys.modules, 'chatterbox.tts', None)
     monkeypatch.setitem(sys.modules, 'sounddevice', None)
     
     from voice_engine.tts import TTSEngine
@@ -36,33 +32,11 @@ def test_tts_engine_initializes_without_crash(tts_engine):
 def test_get_status_returns_all_keys(tts_engine):
     status = tts_engine.get_status()
     expected_keys = {
-        "f5tts_available", "chatterbox_available", "kokoro_available",
-        "voice_ref_file_exists", "active_engine", "audio_output_dir"
+        "active_engine", "kokoro_available", "voice_en", "voice_hi", "speed"
     }
     assert expected_keys.issubset(status.keys())
 
-def test_select_engine_urgent_prefers_kokoro(tts_engine):
-    tts_engine._kokoro_available = True
-    assert tts_engine._select_engine(urgent=True) == "kokoro"
 
-def test_select_engine_non_english_prefers_chatterbox(tts_engine):
-    tts_engine._chatterbox_available = True
-    assert tts_engine._select_engine(language="hi") == "chatterbox"
-
-def test_select_engine_english_default_prefers_f5tts(tts_engine):
-    tts_engine._f5tts_available = True
-    assert tts_engine._select_engine("en", urgent=False) == "f5tts"
-
-def test_select_engine_falls_back_to_kokoro_without_f5tts(tts_engine):
-    tts_engine._f5tts_available = False
-    tts_engine._kokoro_available = True
-    assert tts_engine._select_engine("en") == "kokoro"
-
-def test_select_engine_falls_back_to_console(tts_engine):
-    tts_engine._f5tts_available = False
-    tts_engine._kokoro_available = False
-    tts_engine._chatterbox_available = False
-    assert tts_engine._select_engine() == "console"
 
 def test_split_sentences_single_sentence(tts_engine):
     sentences = tts_engine._split_sentences("Hello, Sir.")
@@ -97,7 +71,7 @@ async def test_speak_empty_text_returns_false(tts_engine):
 async def test_speak_bridging_phrase_code(tts_engine, capsys):
     await tts_engine.speak_bridging_phrase("code")
     captured = capsys.readouterr()
-    assert "developer environment" in captured.out
+    assert "Working on it" in captured.out
 
 @pytest.mark.asyncio
 async def test_speak_bridging_phrase_unknown_key(tts_engine, capsys):
