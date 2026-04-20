@@ -1,246 +1,278 @@
 """
-J.A.R.V.I.S. — memory_vault/chroma_store.py
-ChromaDB interface for persistent JARVIS memory. Full implementation in Phase 4.
+memory_vault/chroma_store.py
+─────────────────────────────
+ChromaDB vector store for JARVIS — pure semantic similarity search.
 
-Uses Qwen3-Embedding-0.6B for semantic embeddings.
+ChromaDB stores embedding vectors. It has NO concept of time.
+Use ChromaDB for stable, rarely-changing facts where temporal ordering
+does not matter (e.g., "User is price-conscious", "User prefers dark mode").
+
+For facts that change over time (framework preferences, current projects,
+deadlines), use GraphitiStore instead — it handles contradictions automatically.
+
+This module is the Tier 3 vector layer. Graphiti is the Tier 3 temporal layer.
+Both are queried at retrieval time and their results are combined.
 
 Author: Hitansu Parichha | Nisum Technologies
-Phase 1 — Blueprint v5.0
+Phase 4 — Blueprint v6.0
 """
 
-from __future__ import annotations
-
+import os
 import logging
 from pathlib import Path
 from typing import Optional
+from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
-_CHROMA_DB_PATH = str(Path(__file__).parent / "chroma_db")
+CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "./memory_vault/chroma_db")
+EMBEDDING_MODEL = os.getenv("GRAPHITI_EMBEDDING_MODEL", "nomic-embed-text")
 
 
 class ChromaStore:
     """
-    Persistent ChromaDB vector store for JARVIS facts and conversations.
+    ChromaDB wrapper for JARVIS vector memory.
 
-    Phase 1 stub: returns empty results gracefully if ChromaDB is unavailable.
-    Phase 4 will activate full embedding + retrieval pipeline with
-    Qwen3-Embedding-0.6B via sentence-transformers.
+    Provides semantic similarity search over all distilled user facts.
+    Works alongside GraphitiStore — this handles the vector layer,
+    Graphiti handles the temporal layer.
     """
 
-    def __init__(self) -> None:
-        """
-        Initialise ChromaDB client and embedding model.
+    COLLECTION_NAME = "jarvis_memory"
 
-        Creates two collections: "jarvis_facts" and "jarvis_conversations".
-        Wraps all initialisation in try/except for graceful Phase 1 degradation.
-        """
+    def __init__(self):
         self._client = None
-        self._facts_collection = None
-        self._conversations_collection = None
-        self._embedder = None
-        self._available = False
-        self._try_init()
+        self._collection = None
+        self._embedding_fn = None
+        self._initialized = False
+        self._persist_dir = CHROMA_PERSIST_DIR
+        Path(self._persist_dir).mkdir(parents=True, exist_ok=True)
 
-    def _try_init(self) -> None:
+    def initialize(self) -> bool:
         """
-        Attempt to initialise ChromaDB and the Qwen3 embedding model.
+        Initialize ChromaDB with persistent storage and Ollama embeddings.
 
-        Logs a warning and disables memory features if either is unavailable.
+        Returns:
+            True if initialization succeeded, False if ChromaDB unavailable.
         """
         try:
             import chromadb
-            self._client = chromadb.PersistentClient(path=_CHROMA_DB_PATH)
-            self._facts_collection = self._client.get_or_create_collection("jarvis_facts")
-            self._conversations_collection = self._client.get_or_create_collection(
-                "jarvis_conversations"
+            from chromadb.utils.embedding_functions import OllamaEmbeddingFunction
+
+            self._client = chromadb.PersistentClient(path=self._persist_dir)
+
+            # Use Ollama embedding model — Qwen3-Embedding-0.6B (fast, good quality)
+            self._embedding_fn = OllamaEmbeddingFunction(
+                url="http://localhost:11434/api/embeddings",
+                model_name=EMBEDDING_MODEL,
             )
-            logger.info("ChromaDB initialised at %s.", _CHROMA_DB_PATH)
+
+            self._collection = self._client.get_or_create_collection(
+                name=self.COLLECTION_NAME,
+                embedding_function=self._embedding_fn,
+                metadata={"description": "JARVIS personal memory — distilled user facts"},
+            )
+
+            self._initialized = True
+            count = self._collection.count()
+            logger.info(f"ChromaStore initialized. Collection has {count} vectors.")
+            return True
         except ImportError:
             logger.warning(
-                "ChromaDB unavailable — memory features disabled until Phase 4. "
-                "Install with: pip install chromadb"
+                "chromadb not installed. Run: pip install chromadb. "
+                "Vector memory will be disabled."
             )
-            return
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("ChromaDB init failed: %s — memory features disabled.", exc)
-            return
+            return False
+        except Exception as e:
+            logger.error(f"ChromaStore initialization failed: {e}")
+            return False
 
-        try:
-            from sentence_transformers import SentenceTransformer
-            self._embedder = SentenceTransformer("Qwen/Qwen3-Embedding-0.6B")
-            logger.info("Qwen3-Embedding-0.6B loaded for memory retrieval.")
-            self._available = True
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "Qwen3-Embedding-0.6B not available: %s — memory retrieval disabled.",
-                exc,
-            )
-            # ChromaDB is available but we cannot embed — partial degradation
-            self._available = False
+    @property
+    def is_available(self) -> bool:
+        """Return True if ChromaDB is initialized and ready."""
+        return self._initialized and self._collection is not None
 
-    def _embed(self, text: str) -> list[float]:
+    def add_fact(
+        self,
+        fact: str,
+        category: str,
+        fact_id: Optional[str] = None,
+        metadata: Optional[dict] = None,
+    ) -> bool:
         """
-        Embed a text string using Qwen3-Embedding-0.6B.
+        Add a fact vector to ChromaDB.
 
         Args:
-            text: Text to embed.
+            fact:     The fact text to embed and store.
+            category: Category label for filtering (e.g., "coding_habit")
+            fact_id:  Optional unique ID. Auto-generated if not provided.
+            metadata: Optional extra metadata dict merged with defaults.
 
         Returns:
-            List of floats representing the embedding vector.
+            True on success, False on error.
         """
-        if self._embedder is None:
-            return []
-        return self._embedder.encode(text).tolist()
+        if not self.is_available:
+            return False
 
-    def store_fact(
-        self, fact: str, category: str, confidence: str = "high"
-    ) -> str:
-        """
-        Store a distilled fact in the "jarvis_facts" ChromaDB collection.
-
-        Args:
-            fact: The factual statement to store.
-            category: One of: coding_habit, tech_preference, work_context,
-                      shopping_behavior, daily_pattern, personal_goal.
-            confidence: "high", "medium", or "low".
-
-        Returns:
-            Document ID string, or empty string if unavailable.
-        """
-        if not self._available or self._facts_collection is None:
-            logger.debug("ChromaDB unavailable — store_fact skipped.")
-            return ""
-
-        import uuid
-        doc_id = str(uuid.uuid4())
-        embedding = self._embed(fact)
         try:
-            self._facts_collection.add(
+            import uuid
+            doc_id = fact_id or f"fact_{uuid.uuid4().hex[:12]}"
+            meta = {
+                "category": category,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+            if metadata:
+                meta.update(metadata)
+
+            self._collection.upsert(
                 documents=[fact],
-                embeddings=[embedding] if embedding else None,
-                metadatas=[{"category": category, "confidence": confidence}],
                 ids=[doc_id],
+                metadatas=[meta],
             )
-            return doc_id
-        except Exception as exc:  # noqa: BLE001
-            logger.error("store_fact failed: %s", exc)
-            return ""
+            logger.debug(f"ChromaStore: added [{category}] {fact[:60]}")
+            return True
+        except Exception as e:
+            logger.error(f"ChromaStore.add_fact failed: {e}")
+            return False
 
-    def query_facts(self, query: str, top_k: int = 5) -> list[dict]:
+    def search(
+        self,
+        query: str,
+        num_results: int = 5,
+        category_filter: Optional[str] = None,
+        min_relevance: float = 0.65,
+    ) -> list[dict]:
         """
-        Semantic search for relevant facts in ChromaDB.
+        Search for semantically similar facts.
 
         Args:
-            query: Natural language query string.
-            top_k: Maximum number of results to return.
+            query:           Natural language query.
+            num_results:     Max results to return.
+            category_filter: Optional category to filter by.
+            min_relevance:   Minimum cosine similarity (0-1). Default 0.65.
 
         Returns:
-            List of dicts with keys: fact, category, confidence, distance.
+            List of dicts: [{text, category, relevance_score, fact_id, created_at}]
         """
-        if not self._available or self._facts_collection is None:
+        if not self.is_available or not query.strip():
             return []
 
-        embedding = self._embed(query)
         try:
-            results = self._facts_collection.query(
-                query_embeddings=[embedding] if embedding else None,
-                query_texts=[query] if not embedding else None,
-                n_results=top_k,
+            where = {"category": category_filter} if category_filter else None
+
+            results = self._collection.query(
+                query_texts=[query],
+                n_results=min(num_results * 2, max(1, self._collection.count())),
+                where=where,
+                include=["documents", "metadatas", "distances"],
             )
+
             facts = []
             docs = results.get("documents", [[]])[0]
             metas = results.get("metadatas", [[]])[0]
             distances = results.get("distances", [[]])[0]
+
             for doc, meta, dist in zip(docs, metas, distances):
+                # ChromaDB returns L2 distance — convert to cosine similarity approx
+                relevance = max(0.0, 1.0 - dist)
+                if relevance < min_relevance:
+                    continue
+
                 facts.append({
-                    "fact": doc,
-                    "category": meta.get("category", "unknown"),
-                    "confidence": meta.get("confidence", "medium"),
-                    "distance": dist,
+                    "text": doc,
+                    "category": meta.get("category", "general"),
+                    "relevance_score": round(relevance, 3),
+                    "fact_id": meta.get("id", ""),
+                    "created_at": meta.get("created_at", ""),
                 })
+
+                if len(facts) >= num_results:
+                    break
+
             return facts
-        except Exception as exc:  # noqa: BLE001
-            logger.error("query_facts failed: %s", exc)
+        except Exception as e:
+            logger.error(f"ChromaStore.search failed: {e}")
             return []
-
-    def store_conversation(
-        self, timestamp: str, role: str, content: str
-    ) -> str:
-        """
-        Store a conversation turn in the "jarvis_conversations" collection.
-
-        Args:
-            timestamp: ISO 8601 timestamp of the conversation turn.
-            role: "user" or "assistant".
-            content: The message content.
-
-        Returns:
-            Document ID string, or empty string if unavailable.
-        """
-        if not self._available or self._conversations_collection is None:
-            return ""
-
-        import uuid
-        doc_id = str(uuid.uuid4())
-        embedding = self._embed(content)
-        try:
-            self._conversations_collection.add(
-                documents=[content],
-                embeddings=[embedding] if embedding else None,
-                metadatas=[{"timestamp": timestamp, "role": role}],
-                ids=[doc_id],
-            )
-            return doc_id
-        except Exception as exc:  # noqa: BLE001
-            logger.error("store_conversation failed: %s", exc)
-            return ""
 
     def delete_fact(self, fact_id: str) -> bool:
         """
-        Delete a specific fact from ChromaDB by document ID.
+        Delete a specific fact by ID.
 
         Args:
-            fact_id: The document ID to delete.
+            fact_id: The ID of the fact to delete.
 
         Returns:
-            True if deleted successfully, False otherwise.
+            True on success, False on error.
         """
-        if not self._available or self._facts_collection is None:
+        if not self.is_available:
             return False
         try:
-            self._facts_collection.delete(ids=[fact_id])
+            self._collection.delete(ids=[fact_id])
+            logger.info(f"ChromaStore: deleted fact {fact_id}")
             return True
-        except Exception as exc:  # noqa: BLE001
-            logger.error("delete_fact failed for id '%s': %s", fact_id, exc)
+        except Exception as e:
+            logger.error(f"ChromaStore.delete_fact failed: {e}")
             return False
 
-    def list_facts(self, limit: int = 20) -> list[dict]:
+    def delete_facts_by_date(self, date_str: str) -> int:
         """
-        Return the most recent facts for user review.
+        Delete all facts created on a specific date.
 
         Args:
-            limit: Maximum number of facts to return.
+            date_str: Date prefix in YYYY-MM-DD format.
 
         Returns:
-            List of fact dicts with fact, category, and confidence keys.
+            Count of deleted facts.
         """
-        if not self._available or self._facts_collection is None:
-            return []
+        if not self.is_available:
+            return 0
         try:
-            results = self._facts_collection.get(limit=limit)
-            facts = []
-            docs = results.get("documents", [])
-            metas = results.get("metadatas", [])
-            ids = results.get("ids", [])
-            for doc, meta, doc_id in zip(docs, metas, ids):
-                facts.append({
-                    "id": doc_id,
-                    "fact": doc,
-                    "category": meta.get("category", "unknown"),
-                    "confidence": meta.get("confidence", "medium"),
-                })
-            return facts
-        except Exception as exc:  # noqa: BLE001
-            logger.error("list_facts failed: %s", exc)
-            return []
+            # Query all facts and filter by date
+            all_results = self._collection.get(
+                include=["metadatas"]
+            )
+            ids_to_delete = []
+            for doc_id, meta in zip(
+                all_results.get("ids", []),
+                all_results.get("metadatas", [])
+            ):
+                created = meta.get("created_at", "")
+                if created.startswith(date_str):
+                    ids_to_delete.append(doc_id)
+
+            if ids_to_delete:
+                self._collection.delete(ids=ids_to_delete)
+                logger.info(f"ChromaStore: deleted {len(ids_to_delete)} facts from {date_str}")
+
+            return len(ids_to_delete)
+        except Exception as e:
+            logger.error(f"ChromaStore.delete_facts_by_date failed: {e}")
+            return 0
+
+    def get_count(self) -> int:
+        """Return total number of stored fact vectors."""
+        if not self.is_available:
+            return 0
+        try:
+            return self._collection.count()
+        except Exception:
+            return 0
+
+    def clear_all(self) -> bool:
+        """
+        Delete the entire collection. DESTRUCTIVE — requires confirmation.
+        Only called by admin commands, never by normal memory flow.
+        """
+        if not self.is_available:
+            return False
+        try:
+            self._client.delete_collection(self.COLLECTION_NAME)
+            self._collection = self._client.get_or_create_collection(
+                name=self.COLLECTION_NAME,
+                embedding_function=self._embedding_fn,
+            )
+            logger.warning("ChromaStore: entire collection cleared")
+            return True
+        except Exception as e:
+            logger.error(f"ChromaStore.clear_all failed: {e}")
+            return False

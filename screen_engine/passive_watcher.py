@@ -1,9 +1,10 @@
 """
 J.A.R.V.I.S. — screen_engine/passive_watcher.py
 Background passive screen monitor stub. Full implementation in Phase 5.
+Phase 4 adds memory logging hook so screen observations feed the nightly distiller.
 
 Author: Hitansu Parichha | Nisum Technologies
-Phase 1 — Blueprint v5.0
+Phase 4 — Blueprint v6.0
 """
 
 from __future__ import annotations
@@ -15,6 +16,13 @@ import time
 from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
+
+# Phase 4: import ConversationLogger for memory integration
+try:
+    from memory_vault.logger import ConversationLogger
+    _CONV_LOGGER_AVAILABLE = True
+except ImportError:
+    _CONV_LOGGER_AVAILABLE = False
 
 
 class PassiveWatcher:
@@ -46,6 +54,8 @@ class PassiveWatcher:
         self.suppressed_suggestions: list[str] = []
         self._suppression_until: float = 0.0
         self._thread: Optional[threading.Thread] = None
+        # Phase 4: memory logging hook
+        self._conv_logger = ConversationLogger() if _CONV_LOGGER_AVAILABLE else None
 
     def start(self) -> None:
         """
@@ -106,13 +116,29 @@ class PassiveWatcher:
     def _watch_loop(self) -> None:
         """
         Main background loop. Phase 5 will add screenshot capture and inference.
+        Phase 4 adds memory logging hook for any observations generated.
         """
         logger.info("PassiveWatcher loop running (Phase 5 stub — no screenshots yet).")
         while self.running:
             time.sleep(2)
+
+            # Phase 4: Check PASSIVE_LEARNING_PAUSE_MINUTES
+            pause_minutes = int(os.getenv("PASSIVE_LEARNING_PAUSE_MINUTES", "0"))
+            if pause_minutes > 0:
+                # Simple implementation: skip this observation cycle
+                continue
+
             # Phase 5 will:
             # 1. Capture screenshot via ScreenVision.capture_screenshot()
             # 2. Pass to screen_vision_passive agent via ModeManager
-            # 3. Parse response for suggestion
+            # 3. Parse response to get observation_text
             # 4. If suggestion and cooldown elapsed: call self.suggestion_callback()
             # 5. If suppressed: append to self.suppressed_suggestions
+
+            # Phase 4 memory hook (called once Phase 5 sets observation_text):
+            # observation_text = ""  # Phase 5 fills this
+            # if self._conv_logger and observation_text:
+            #     self._conv_logger.log_screen_observation(
+            #         observation=observation_text,
+            #         source="passive_watcher",
+            #     )

@@ -8,6 +8,10 @@ httpx>=0.28.0
 # Memory
 chromadb>=0.6.0
 sentence-transformers>=3.0.0
+graphiti-core          # Temporal knowledge graph (Phase 4)
+kuzu                   # Embedded graph database backend for Graphiti (Phase 4)
+python-dateutil        # Date arithmetic for temporal queries (Phase 4)
+ollama                 # Embeddings for ChromaDB (Phase 4)
 
 # Voice — STT
 openai-whisper>=20240930

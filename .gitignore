@@ -15,7 +15,11 @@ build/
 
 # JARVIS Data (private)
 memory_vault/chroma_db/
+memory_vault/kuzu_db/
 memory_vault/logs/
+# Wiki files are auto-generated. Only commit empty stubs.
+# Remove the next line if you want to version-control wiki content.
+memory_vault/wiki/*.md
 sandbox/audit.log
 voice_engine/jarvis_ref.wav
 voice_engine/jarvis_ref_calm.wav

@@ -3,7 +3,7 @@ J.A.R.V.I.S. — core_engine/gateway.py
 FastAPI main application. ALL requests enter through here.
 
 Author: Hitansu Parichha | Nisum Technologies
-Phase 1 — Blueprint v5.0
+Phase 4 — Blueprint v6.0 (Infinite Personalized Memory)
 """
 
 from __future__ import annotations
@@ -56,6 +56,16 @@ from voice_engine.wake_word import get_wake_word_detector, WakeWordDetector
 from voice_engine.voice_session import get_voice_session_manager, VoiceSessionManager
 
 # ---------------------------------------------------------------------------
+# Phase 4 — Memory system imports (graceful: all degrade if not installed)
+# ---------------------------------------------------------------------------
+from memory_vault.chroma_store import ChromaStore
+from memory_vault.graphiti_store import GraphitiStore
+from memory_vault.retriever import HybridRetriever
+from memory_vault.distiller import MemoryDistiller, setup_distiller_scheduler
+from memory_vault.logger import ConversationLogger
+from memory_vault.correction_parser import parse_correction_command
+
+# ---------------------------------------------------------------------------
 # Paths & constants
 # ---------------------------------------------------------------------------
 _AUDIT_LOG_PATH = _PROJECT_ROOT / "sandbox" / "audit.log"
@@ -73,6 +83,14 @@ _audit: Optional[AuditManager] = None
 _voice_session: Optional[VoiceSessionManager] = None
 _tts_engine: Optional[TTSEngine] = None
 _stt_engine: Optional[STTEngine] = None
+
+# Phase 4 memory singletons
+_chroma_store: Optional[ChromaStore] = None
+_graphiti_store: Optional[GraphitiStore] = None
+_retriever: Optional[HybridRetriever] = None
+_distiller: Optional[MemoryDistiller] = None
+_conv_logger: Optional[ConversationLogger] = None
+_distiller_scheduler = None
 
 
 # ===========================================================================
@@ -114,14 +132,22 @@ class ModeResponse(BaseModel):
 class MemoryQueryRequest(BaseModel):
     """Request body for POST /memory/query."""
 
-    query: str
+    query: Optional[str] = None
     top_k: int = 5
 
 
 class MemoryQueryResponse(BaseModel):
-    """Response body for POST /memory/query (Phase 4 stub)."""
+    """Response body for POST /memory/query."""
 
+    query: str
+    context: str
     facts: list[str]
+
+
+class MemoryCorrectRequest(BaseModel):
+    """Request body for POST /memory/correct."""
+
+    command: Optional[str] = None
 
 
 class SpecSheet(BaseModel):
@@ -219,6 +245,7 @@ async def lifespan(app: FastAPI):
     - Prints JARVIS boot message
     """
     global _registry, _router, _mode_manager, _security_enforcer, _audit, _voice_session, _tts_engine, _stt_engine
+    global _chroma_store, _graphiti_store, _retriever, _distiller, _conv_logger, _distiller_scheduler
 
     import asyncio
 
@@ -343,9 +370,51 @@ async def lifespan(app: FastAPI):
         "error_message": None,
     })
 
+    # ── Phase 4: Initialize memory system ────────────────────────────────────
+    _conv_logger = ConversationLogger()
+
+    _chroma_store = ChromaStore()
+    chroma_ok = _chroma_store.initialize()
+
+    _graphiti_store = GraphitiStore()
+    graphiti_ok = await _graphiti_store.initialize()
+
+    _retriever = HybridRetriever(
+        graphiti_store=_graphiti_store,
+        chroma_store=_chroma_store,
+    )
+
+    _distiller = MemoryDistiller(
+        chroma_store=_chroma_store,
+        graphiti_store=_graphiti_store,
+        mode_manager=_mode_manager,
+    )
+    _distiller_scheduler = setup_distiller_scheduler(_distiller)
+
+    # Expose memory components on app.state for tests
+    app.state.chroma_store = _chroma_store
+    app.state.graphiti_store = _graphiti_store
+    app.state.conv_logger = _conv_logger
+
+    memory_status = []
+    if chroma_ok:
+        memory_status.append("ChromaDB")
+    if graphiti_ok:
+        memory_status.append("Graphiti")
+    memory_status.extend(["Wiki", "Logger"])
+    logger.info("Memory system initialized: %s", " + ".join(memory_status))
+    print(f"  Memory   : {' + '.join(memory_status)}")
+
     yield  # ← server runs here
 
     # ---- Shutdown ----
+    if _distiller_scheduler:
+        try:
+            _distiller_scheduler.shutdown(wait=False)
+        except Exception:
+            pass
+    if _graphiti_store:
+        await _graphiti_store.close()
     logger.info("J.A.R.V.I.S. shutting down. Standing by, Sir.")
 
 
@@ -506,6 +575,18 @@ async def chat(request: ChatRequest, speak: bool = False):
     if not request.message or not request.message.strip():
         raise HTTPException(status_code=422, detail="Message cannot be empty.")
 
+    # ── Phase 4 Step A: Check for memory correction commands FIRST ─────────────
+    _CORRECTION_TRIGGERS = [
+        "forget that", "remember that", "what do you know about me",
+        "show me my", "clear everything", "do not learn", "don't learn",
+        "stop remembering", "remove that", "stop learning",
+    ]
+    msg_lower = request.message.lower()
+    if any(trigger in msg_lower for trigger in _CORRECTION_TRIGGERS):
+        action = parse_correction_command(request.message)
+        if action.action_type != "UNKNOWN":
+            return await _handle_memory_command(action)
+
     # Step 1: Determine effective mode
     original_mode = _mode_manager.get_current_mode()
     if request.mode_override:
@@ -524,10 +605,19 @@ async def chat(request: ChatRequest, speak: bool = False):
     score: int = classification["score"]
     recommended_agent: str = classification["recommended_agent"]
 
-    # Step 3: Build system prompt (JARVIS_CORE.md prepended inside get_system_prompt)
+    # Step 3: Build system prompt + Phase 4 memory context
     system_prompt = _registry.get_system_prompt(recommended_agent)
 
-    # Read per-agent temperature from registry (code_specialist=0.1, auditor=0.1, etc.)
+    # ── Phase 4 Step B: Inject memory context into system prompt ──────────────
+    if _retriever:
+        try:
+            memory_context = await _retriever.get_context(request.message)
+            if memory_context:
+                system_prompt = f"{system_prompt}\n\n{memory_context}"
+        except Exception as _mem_exc:
+            logger.warning("Memory context retrieval failed (non-critical): %s", _mem_exc)
+
+    # Read per-agent temperature from registry
     agent_def = _registry.get_agent(recommended_agent)
     agent_temperature: float = agent_def.get("temperature", 0.7) if agent_def else 0.7
 
@@ -543,12 +633,25 @@ async def chat(request: ChatRequest, speak: bool = False):
             system_prompt=system_prompt,
             user_message=user_message,
             complexity_score=score,
-            temperature=agent_temperature,   # ← FIX 1: use per-agent temperature
+            temperature=agent_temperature,
         )
     finally:
-        # Restore original mode if it was overridden for this request
         if request.mode_override:
             _mode_manager.set_mode(original_mode)
+
+    response_text = result.get("content", "")
+
+    # ── Phase 4 Step C: Log conversation turn ────────────────────────────────
+    if _conv_logger:
+        try:
+            _conv_logger.log_conversation(
+                user_message=request.message,
+                jarvis_response=response_text,
+                agent_used=recommended_agent,
+                model_used=result.get("model_used", "unknown"),
+            )
+        except Exception as _log_exc:
+            logger.warning("Conversation logging failed (non-critical): %s", _log_exc)
 
     # Step 6: Audit and return
     _write_audit_log({
@@ -562,7 +665,6 @@ async def chat(request: ChatRequest, speak: bool = False):
         "error_message": None,
     })
 
-    response_text = result.get("content", "")
     if speak and response_text:
         await _voice_session.speak_response(response_text)
 
@@ -573,6 +675,86 @@ async def chat(request: ChatRequest, speak: bool = False):
         complexity_score=score,
         mode=result.get("mode", _mode_manager.get_current_mode()),
     )
+
+
+async def _handle_memory_command(action) -> ChatResponse:
+    """
+    Dispatch a parsed memory correction command and return a JARVIS response.
+    Called when the user issues a memory command before routing to any agent.
+    """
+    from memory_vault.correction_parser import MemoryAction
+    from pathlib import Path
+
+    action_type = action.action_type
+    response_text = "Understood, Sir."
+
+    try:
+        if action_type == "FORGET" and action.entity:
+            if _chroma_store and _chroma_store.is_available:
+                _chroma_store.delete_facts_by_date("")
+            if _graphiti_store and _graphiti_store.is_available:
+                await _graphiti_store.invalidate_fact_by_text(action.entity)
+            # Append to corrections wiki
+            _append_correction(f"FORGET | {action.entity}")
+            response_text = f"Understood, Sir. I have removed all memory of your use of {action.entity}."
+
+        elif action_type == "REMEMBER" and action.entity:
+            if _chroma_store and _chroma_store.is_available:
+                _chroma_store.add_fact(action.entity, category="user_correction")
+            if _graphiti_store and _graphiti_store.is_available:
+                await _graphiti_store.add_fact(action.entity, category="user_correction", source="user_correction")
+            _append_correction(f"REMEMBER | {action.entity}")
+            response_text = f"Noted, Sir. I have updated my memory: {action.entity}."
+
+        elif action_type == "SHOW_PROFILE":
+            wiki_file = Path("./memory_vault/wiki/user_profile.md")
+            profile = wiki_file.read_text() if wiki_file.exists() else "No profile compiled yet, Sir. Check back after the first nightly distillation."
+            response_text = f"Here is what I know about you, Sir:\n{profile}"
+
+        elif action_type == "SHOW_WIKI":
+            wiki_file = Path(f"./memory_vault/wiki/{action.wiki_file}.md")
+            content = wiki_file.read_text() if wiki_file.exists() else f"No {action.wiki_file} wiki compiled yet, Sir."
+            response_text = content
+
+        elif action_type == "CLEAR_DATE" and action.target_date:
+            if _chroma_store and _chroma_store.is_available:
+                _chroma_store.delete_facts_by_date(action.target_date)
+            if _graphiti_store and _graphiti_store.is_available:
+                await _graphiti_store.invalidate_facts_by_date(action.target_date)
+            response_text = f"Understood, Sir. I have cleared everything I learned on {action.target_date}."
+
+        elif action_type == "PAUSE_LEARNING":
+            import memory_vault.logger as log_module
+            log_module.PASSIVE_LEARNING_ENABLED = False
+            asyncio.get_event_loop().call_later(
+                action.pause_minutes * 60,
+                lambda: setattr(log_module, "PASSIVE_LEARNING_ENABLED", True)
+            )
+            response_text = f"Understood, Sir. I will not learn from the next {action.pause_minutes} minutes."
+
+    except Exception as e:
+        logger.error("Memory command execution failed: %s", e)
+        response_text = "I encountered an issue processing that memory command, Sir."
+
+    return ChatResponse(
+        response=response_text,
+        agent_used="memory_system",
+        model_used="none",
+        complexity_score=0,
+        mode=_mode_manager.get_current_mode() if _mode_manager else "offline",
+    )
+
+
+def _append_correction(entry: str) -> None:
+    """Append a correction entry to wiki/corrections.md."""
+    try:
+        from datetime import datetime, timezone
+        corrections_file = Path("./memory_vault/wiki/corrections.md")
+        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        with open(corrections_file, "a", encoding="utf-8") as f:
+            f.write(f"\n- [{timestamp}] {entry}")
+    except Exception as e:
+        logger.warning("Could not write corrections.md: %s", e)
 
 
 @app.post("/mode", response_model=ModeResponse)
@@ -639,26 +821,139 @@ async def switch_mode(request: ModeRequest):
     )
 
 
-@app.post("/memory/query", response_model=MemoryQueryResponse)
+# ===========================================================================
+# Phase 4 — Memory Routes
+# ===========================================================================
+
+@app.get("/memory/stats")
+async def memory_stats():
+    """
+    Return memory system statistics.
+
+    Returns:
+        JSON with chroma_vectors, graphiti_nodes, wiki_files, log_files.
+    """
+    # Use app.state if available (allows test injection of mocks)
+    chroma = getattr(app.state, "chroma_store", _chroma_store)
+    graphiti = getattr(app.state, "graphiti_store", _graphiti_store)
+    conv_log = getattr(app.state, "conv_logger", _conv_logger)
+
+    chroma_count = 0
+    if chroma and chroma.is_available:
+        chroma_count = chroma.get_count()
+
+    graphiti_nodes = 0
+    if graphiti and graphiti.is_available:
+        try:
+            graphiti_nodes = await graphiti.get_node_count()
+        except Exception:
+            graphiti_nodes = 0
+
+    wiki_files = []
+    wiki_dir = Path("./memory_vault/wiki")
+    if wiki_dir.exists():
+        wiki_files = [f.name for f in wiki_dir.glob("*.md")]
+
+    log_files = []
+    if conv_log:
+        try:
+            log_files = conv_log.list_log_files()
+        except Exception:
+            log_files = []
+
+    return {
+        "chroma_vectors": chroma_count,
+        "graphiti_nodes": graphiti_nodes,
+        "wiki_files": wiki_files,
+        "log_files": len(log_files),
+        "chroma_available": bool(chroma and chroma.is_available),
+        "graphiti_available": bool(graphiti and graphiti.is_available),
+    }
+
+
+@app.get("/memory/wiki")
+async def memory_wiki():
+    """
+    List all compiled wiki files with their sizes.
+
+    Returns:
+        JSON with wiki_files list of {name, size_kb} dicts.
+    """
+    wiki_dir = Path("./memory_vault/wiki")
+    files = []
+    if wiki_dir.exists():
+        for f in sorted(wiki_dir.glob("*.md")):
+            size_kb = round(f.stat().st_size / 1024, 2)
+            files.append({"name": f.name, "size_kb": size_kb})
+    return {"wiki_files": files}
+
+
+@app.post("/memory/query")
 async def memory_query(request: MemoryQueryRequest):
     """
-    Query the JARVIS memory system for relevant facts.
-
-    Phase 4 stub — returns empty list until ChromaDB is activated.
+    Query the JARVIS hybrid memory system for relevant facts.
 
     Args:
         request: MemoryQueryRequest with query string and optional top_k.
 
     Returns:
-        MemoryQueryResponse with empty facts list (Phase 4 stub).
+        JSON with query, context block, and list of raw facts.
     """
-    logger.info(
-        "Memory query stub called: query='%s', top_k=%d — awaiting Phase 4.",
-        request.query[:80],
-        request.top_k,
-    )
-    # Phase 4 will replace this with: ChromaStore().query_facts(request.query, request.top_k)
-    return MemoryQueryResponse(facts=[])
+    if not request.query or not request.query.strip():
+        return {"error": "query field is required", "query": "", "context": "", "facts": []}
+
+    chroma = getattr(app.state, "chroma_store", _chroma_store)
+    graphiti = getattr(app.state, "graphiti_store", _graphiti_store)
+
+    if not _retriever and not chroma and not graphiti:
+        return {"query": request.query, "context": "", "facts": [], "status": "degraded"}
+
+    try:
+        retriever = _retriever or HybridRetriever(graphiti_store=graphiti, chroma_store=chroma)
+        context = await retriever.get_context(request.query, top_k=request.top_k)
+        # Extract individual fact lines from the context block
+        facts = [
+            line.lstrip("• ").split("  [")[0].strip()
+            for line in context.splitlines()
+            if line.startswith("•")
+        ]
+        return {"query": request.query, "context": context, "facts": facts}
+    except Exception as e:
+        logger.error("Memory query failed: %s", e)
+        return {"query": request.query, "context": "", "facts": [], "error": str(e)}
+
+
+@app.post("/memory/correct")
+async def memory_correct(request: MemoryCorrectRequest):
+    """
+    Process a memory correction command from the user.
+
+    Args:
+        request: MemoryCorrectRequest with command string.
+
+    Returns:
+        JSON with action_type, entity, and JARVIS response.
+    """
+    if not request.command or not request.command.strip():
+        return {"error": "command field is required"}
+
+    action = parse_correction_command(request.command)
+    if action.action_type == "UNKNOWN":
+        return {
+            "action_type": "UNKNOWN",
+            "entity": "",
+            "response": "I did not recognize that as a memory command, Sir.",
+        }
+
+    chat_response = await _handle_memory_command(action)
+    return {
+        "action_type": action.action_type,
+        "entity": action.entity,
+        "wiki_file": action.wiki_file,
+        "pause_minutes": action.pause_minutes,
+        "target_date": action.target_date,
+        "response": chat_response.response,
+    }
 
 
 @app.post("/screen/capture")
