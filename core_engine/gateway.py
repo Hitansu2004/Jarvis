@@ -64,6 +64,7 @@ from memory_vault.retriever import HybridRetriever
 from memory_vault.distiller import MemoryDistiller, setup_distiller_scheduler
 from memory_vault.logger import ConversationLogger
 from memory_vault.correction_parser import parse_correction_command
+from memory_vault.profile_updater import update_jarvis_core_profile
 
 # ---------------------------------------------------------------------------
 # Paths & constants
@@ -405,6 +406,19 @@ async def lifespan(app: FastAPI):
     logger.info("Memory system initialized: %s", " + ".join(memory_status))
     print(f"  Memory   : {' + '.join(memory_status)}")
 
+    # ── Profile Updater: inject wiki profile into JARVIS_CORE.md ──────────────
+    # Runs best-effort at startup. If wiki/user_profile.md has distilled content,
+    # the USER PROFILE section in JARVIS_CORE.md is refreshed automatically.
+    try:
+        updated = update_jarvis_core_profile()
+        if updated:
+            logger.info("profile_updater: JARVIS_CORE.md USER PROFILE refreshed from wiki")
+            print("  Profile  : Updated from wiki/user_profile.md")
+        else:
+            print("  Profile  : Static (wiki not yet distilled — runs after first nightly job)")
+    except Exception as _pe:
+        logger.warning(f"profile_updater skipped: {_pe}")
+
     yield  # ← server runs here
 
     # ---- Shutdown ----
@@ -691,7 +705,7 @@ async def _handle_memory_command(action) -> ChatResponse:
     try:
         if action_type == "FORGET" and action.entity:
             if _chroma_store and _chroma_store.is_available:
-                _chroma_store.delete_facts_by_date("")
+                _chroma_store.delete_facts_by_content(action.entity)
             if _graphiti_store and _graphiti_store.is_available:
                 await _graphiti_store.invalidate_fact_by_text(action.entity)
             # Append to corrections wiki
@@ -1081,3 +1095,42 @@ async def voice_suppressed():
 @app.get("/voice/status")
 async def voice_status():
     return _voice_session.get_status()
+
+
+@app.post("/memory/distill")
+async def memory_distill_manual(force: bool = True):
+    """
+    Manually trigger memory distillation for today's log.
+
+    Query param:
+        force: If true, run even if log is below the size threshold (default True).
+
+    Use this to test distillation without waiting for 2:00 AM.
+    Example: POST /memory/distill?force=true
+    """
+    if not _distiller:
+        return {"status": "error", "message": "Distiller not initialized"}
+    try:
+        result = await _distiller.run(force=force)
+        return {"status": "ok", "result": result}
+    except Exception as e:
+        logger.error(f"Manual distillation failed: {e}")
+        return {"status": "error", "message": str(e)}
+
+
+@app.get("/memory/logs")
+async def memory_logs():
+    """
+    List all conversation log files with metadata.
+
+    Returns dates, sizes, and paths for all daily log files in memory_vault/logs/.
+    Useful for verifying conversations are being logged correctly after POST /chat.
+    """
+    if not _conv_logger:
+        return {"log_files": [], "count": 0}
+    try:
+        files = _conv_logger.list_log_files()
+        return {"log_files": files, "count": len(files)}
+    except Exception as e:
+        logger.error(f"memory_logs endpoint failed: {e}")
+        return {"log_files": [], "count": 0, "error": str(e)}

@@ -249,6 +249,38 @@ class ChromaStore:
             logger.error(f"ChromaStore.delete_facts_by_date failed: {e}")
             return 0
 
+    def delete_facts_by_content(self, text: str) -> int:
+        """
+        Search for facts similar to text and delete the best match.
+
+        Used by the FORGET memory correction command. Performs a semantic
+        similarity search and removes the closest matching fact.
+
+        Args:
+            text: The text to search for and delete (e.g. "Tailwind CSS")
+
+        Returns:
+            Count of facts deleted (0 or 1).
+        """
+        if not self.is_available or not text.strip():
+            return 0
+        try:
+            results = self._collection.query(
+                query_texts=[text],
+                n_results=3,
+                include=["ids", "distances"],
+            )
+            ids = results.get("ids", [[]])[0]
+            if ids:
+                best_id = ids[0]  # Closest semantic match
+                self._collection.delete(ids=[best_id])
+                logger.info(f"ChromaStore: deleted fact matching '{text[:60]}'")
+                return 1
+            return 0
+        except Exception as e:
+            logger.error(f"ChromaStore.delete_facts_by_content failed: {e}")
+            return 0
+
     def get_count(self) -> int:
         """Return total number of stored fact vectors."""
         if not self.is_available:
