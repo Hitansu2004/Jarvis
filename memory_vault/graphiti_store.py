@@ -53,7 +53,7 @@ class GraphitiStore:
         self._client = None
         self._initialized = False
         self._db_path = Path(GRAPHITI_DB_DIR)
-        self._db_path.mkdir(parents=True, exist_ok=True)
+        self._db_path.parent.mkdir(parents=True, exist_ok=True)
 
     async def initialize(self) -> bool:
         """
@@ -65,9 +65,32 @@ class GraphitiStore:
         try:
             from graphiti_core import Graphiti
             from graphiti_core.driver.kuzu_driver import KuzuDriver
+            from graphiti_core.llm_client.openai_client import OpenAIClient
+            from graphiti_core.llm_client.config import LLMConfig
+            from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
+            import os
+
+            ollama_url = os.getenv("OLLAMA_HOST", "http://localhost:11434") + "/v1"
+            llm_model = os.getenv("MODEL_ORCHESTRATOR", "gemma4:e4b")
+            embed_model = os.getenv("GRAPHITI_EMBEDDING_MODEL", "nomic-embed-text")
+
+            llm_config = LLMConfig(api_key="ollama", base_url=ollama_url, model=llm_model)
+            from memory_vault.ollama_client import OllamaGraphitiClient
+            llm_client = OllamaGraphitiClient(config=llm_config)
+
+            embedder_config = OpenAIEmbedderConfig(api_key="ollama", base_url=ollama_url, embedding_model=embed_model)
+            embedder = OpenAIEmbedder(config=embedder_config)
+
+            from graphiti_core.cross_encoder.openai_reranker_client import OpenAIRerankerClient
+            cross_encoder = OpenAIRerankerClient(config=llm_config, client=llm_client)
 
             driver = KuzuDriver(str(self._db_path))
-            self._client = Graphiti(driver=driver)
+            self._client = Graphiti(
+                graph_driver=driver,
+                llm_client=llm_client,
+                embedder=embedder,
+                cross_encoder=cross_encoder
+            )
             await self._client.build_indices_and_constraints()
             self._initialized = True
             logger.info(f"GraphitiStore initialized at {self._db_path}")
@@ -170,11 +193,16 @@ class GraphitiStore:
                 if not fact_text:
                     continue
 
+                category = "general"
+                if fact_text.startswith("["):
+                    end_idx = fact_text.find("]")
+                    if end_idx != -1:
+                        category = fact_text[1:end_idx].lower()
+                        fact_text = fact_text[end_idx+1:].strip()
+
                 result = {
                     "text": fact_text,
-                    "category": getattr(edge, "fact_embedding", {}).get("category", "general")
-                    if isinstance(getattr(edge, "fact_embedding", None), dict)
-                    else "general",
+                    "category": category,
                     "confidence": getattr(edge, "score", 0.8),
                     "valid_from": str(getattr(edge, "valid_at", "")),
                     "source": getattr(edge, "source_description", "unknown"),
@@ -267,7 +295,8 @@ class GraphitiStore:
             return 0
         try:
             # Graphiti doesn't expose direct count — estimate from search
-            results = await self._client.search("", num_results=1000)
+            # Search for 'user' instead of empty string since BM25 ignores empty
+            results = await self._client.search("user", num_results=1000)
             return len(results)
         except Exception:
             return 0

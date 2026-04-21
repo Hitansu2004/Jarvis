@@ -194,13 +194,15 @@ class MemoryDistiller:
         try:
             prompt = _EXTRACTION_PROMPT.format(conversation=conversation_text[:8000])
             response = await self._mode_manager.complete(
-                prompt=prompt,
-                model_override=os.getenv("MODEL_MEMORY_DISTILLER", "gemma4:e4b"),
-                max_tokens=2000,
+                agent_name="memory_distiller",
+                system_prompt="You extract facts. Return JSON array only.",
+                user_message=prompt,
+                complexity_score=3,
                 temperature=0.1,
+                max_tokens=2000,
             )
 
-            response_text = response.get("text", "") if isinstance(response, dict) else str(response)
+            response_text = response.get("content", "") if isinstance(response, dict) else str(response)
 
             # Extract JSON array from response (model may include extra text)
             json_match = re.search(r"\[.*\]", response_text, re.DOTALL)

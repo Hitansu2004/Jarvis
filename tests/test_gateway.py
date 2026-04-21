@@ -15,8 +15,23 @@ from core_engine.gateway import app
 # Use the context manager so the lifespan runs and singletons are initialized
 @pytest.fixture(scope="module")
 def client():
-    with TestClient(app) as c:
-        yield c
+    # Mock GraphitiStore entirely to prevent Kuzu DB segfault in gateway tests
+    from unittest.mock import patch
+    import memory_vault.graphiti_store as gs
+    import core_engine.gateway as gw
+    
+    class MockStoreForGateway:
+        def __init__(self):
+            self.is_available = True
+        async def initialize(self): return True
+        async def search_current(self, *args, **kwargs): return []
+        async def add_fact(self, *args, **kwargs): return True
+        async def close(self): pass
+        
+    with patch.object(gw, "GraphitiStore", MockStoreForGateway, create=True), \
+         patch.object(gs, "GraphitiStore", MockStoreForGateway):
+        with TestClient(app) as c:
+            yield c
 
 
 # ---------------------------------------------------------------------------

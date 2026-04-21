@@ -268,7 +268,7 @@ class ChromaStore:
             results = self._collection.query(
                 query_texts=[text],
                 n_results=3,
-                include=["ids", "distances"],
+                include=["documents", "distances"],
             )
             ids = results.get("ids", [[]])[0]
             if ids:
