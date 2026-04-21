@@ -16,6 +16,9 @@ import time
 from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
+from screen_engine.context_classifier import get_context_classifier, ContextClassifier
+from screen_engine.suggestion_engine import get_suggestion_engine, SuggestionEngine
+
 
 # Phase 4: import ConversationLogger for memory integration
 try:
@@ -56,6 +59,13 @@ class PassiveWatcher:
         self._thread: Optional[threading.Thread] = None
         # Phase 4: memory logging hook
         self._conv_logger = ConversationLogger() if _CONV_LOGGER_AVAILABLE else None
+        self._vision: Optional[ScreenVision] = None  # injected from gateway
+        self._mode_manager = None  # injected from gateway
+        self._agent_registry = None  # injected from gateway
+        self._tts_speak_callback: Optional[Callable[[str], None]] = None  # injected
+        self._context_classifier: ContextClassifier = get_context_classifier()
+        self._suggestion_engine: SuggestionEngine = get_suggestion_engine()
+        self._last_context: Optional[dict] = None  # cache last screen context
 
     def start(self) -> None:
         """
@@ -113,32 +123,132 @@ class PassiveWatcher:
         self.suppressed_suggestions.clear()
         return result
 
+    def inject_dependencies(
+        self,
+        vision,
+        mode_manager,
+        agent_registry,
+        tts_speak_callback: Callable[[str], None],
+    ) -> None:
+        """
+        Inject gateway singletons after PassiveWatcher is created.
+        Called from gateway lifespan startup after all singletons are ready.
+
+        Args:
+            vision: ScreenVision singleton.
+            mode_manager: ModeManager singleton.
+            agent_registry: AgentRegistry singleton.
+            tts_speak_callback: Async function to speak a string via TTS.
+        """
+        self._vision = vision
+        self._mode_manager = mode_manager
+        self._agent_registry = agent_registry
+        self._tts_speak_callback = tts_speak_callback
+        logger.info("PassiveWatcher dependencies injected.")
+
+    async def _process_one_frame(self) -> None:
+        """
+        Process a single observation cycle.
+        Called from _watch_loop in an async context.
+        """
+        if not self._vision or not self._mode_manager:
+            return  # Dependencies not injected yet
+
+        try:
+            # Capture and describe screen
+            vision_output = await self._vision.capture_and_describe(
+                deep=False,
+                mode_manager=self._mode_manager,
+                agent_registry=self._agent_registry,
+            )
+
+            # Classify context
+            context = self._context_classifier.classify(vision_output)
+            self._last_context = vision_output
+
+            # Log observation to memory (Phase 4 integration)
+            if self._conv_logger:
+                observation_text = self._context_classifier.to_memory_observation(context)
+                if observation_text:
+                    self._conv_logger.log_screen_observation(
+                        observation=observation_text,
+                        source="passive_watcher",
+                    )
+
+            # Check if we should generate a suggestion
+            if not self._suggestion_engine.is_suppressed():
+                if self._suggestion_engine.should_suggest(context):
+                    suggestion_text = self._suggestion_engine.generate_suggestion(context)
+                    if suggestion_text:
+                        now = time.monotonic()
+                        if now < self._suppression_until:
+                            # Suggestions suppressed — queue it
+                            self.suppressed_suggestions.append(suggestion_text)
+                            logger.debug("Suggestion queued (suppressed): %s", suggestion_text[:60])
+                        else:
+                            # Deliver suggestion via TTS
+                            self._suggestion_engine.record_suggestion_delivered()
+                            self.last_suggestion_time = time.time()
+                            logger.info("Proactive suggestion: %s", suggestion_text[:80])
+                            if self._tts_speak_callback:
+                                try:
+                                    await self._tts_speak_callback(suggestion_text)
+                                except Exception as tts_exc:
+                                    logger.warning("TTS suggestion delivery failed: %s", tts_exc)
+
+        except Exception as exc:
+            logger.error("PassiveWatcher frame processing error: %s", exc)
+
     def _watch_loop(self) -> None:
         """
-        Main background loop. Phase 5 will add screenshot capture and inference.
-        Phase 4 adds memory logging hook for any observations generated.
-        """
-        logger.info("PassiveWatcher loop running (Phase 5 stub — no screenshots yet).")
-        while self.running:
-            time.sleep(2)
+        Main background loop — captures screenshot every 2 seconds,
+        classifies context, generates suggestions, logs observations.
 
-            # Phase 4: Check PASSIVE_LEARNING_PAUSE_MINUTES
+        Phase 5 full implementation.
+        """
+        import asyncio
+
+        # Check if passive vision is enabled
+        if not os.getenv("SCREEN_VISION_ENABLED", "true").lower() == "true":
+            logger.info("SCREEN_VISION_ENABLED=false — PassiveWatcher idle.")
+            while self.running:
+                time.sleep(2)
+            return
+
+        logger.info("PassiveWatcher active — capturing every 2 seconds.")
+
+        while self.running:
+            time.sleep(2)  # 0.5 Hz capture rate
+
+            # Check passive learning pause
             pause_minutes = int(os.getenv("PASSIVE_LEARNING_PAUSE_MINUTES", "0"))
             if pause_minutes > 0:
-                # Simple implementation: skip this observation cycle
+                logger.debug("Passive learning paused for %d more minutes.", pause_minutes)
                 continue
 
-            # Phase 5 will:
-            # 1. Capture screenshot via ScreenVision.capture_screenshot()
-            # 2. Pass to screen_vision_passive agent via ModeManager
-            # 3. Parse response to get observation_text
-            # 4. If suggestion and cooldown elapsed: call self.suggestion_callback()
-            # 5. If suppressed: append to self.suppressed_suggestions
+            # Run async frame processing in the thread's event loop
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    loop.run_until_complete(self._process_one_frame())
+                finally:
+                    loop.close()
+            except Exception as exc:
+                logger.error("PassiveWatcher loop error: %s", exc)
 
-            # Phase 4 memory hook (called once Phase 5 sets observation_text):
-            # observation_text = ""  # Phase 5 fills this
-            # if self._conv_logger and observation_text:
-            #     self._conv_logger.log_screen_observation(
-            #         observation=observation_text,
-            #         source="passive_watcher",
-            #     )
+    def get_last_context(self) -> Optional[dict]:
+        """Return the most recent vision output dict, or None if no frames processed yet."""
+        return self._last_context
+
+    def get_status(self) -> dict:
+        """Return full PassiveWatcher status."""
+        return {
+            "running": self.running,
+            "screen_vision_enabled": os.getenv("SCREEN_VISION_ENABLED", "true").lower() == "true",
+            "cooldown_seconds": self.cooldown_seconds,
+            "vision_injected": self._vision is not None,
+            "mode_manager_injected": self._mode_manager is not None,
+            "last_context": self._last_context,
+            "suggestion_engine": self._suggestion_engine.get_status() if self._suggestion_engine else {},
+        }

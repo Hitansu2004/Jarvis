@@ -43,49 +43,176 @@ class ScreenVision:
                 "Install with: pip install mss"
             )
 
-    async def capture_and_describe(self, deep: bool = False) -> dict:
+    async def capture_and_describe(
+        self,
+        deep: bool = False,
+        mode_manager = None,
+        agent_registry = None,
+    ) -> dict:
         """
-        Capture the current screen and return a visual description.
+        Capture the current screen and return a structured visual description.
+
+        Uses Gemma 4 E4B for passive/fast analysis (deep=False) or
+        Gemma 4 26B-A4B for deep analysis (deep=True).
+
+        Requires mode_manager and agent_registry to be passed in from the gateway.
+        Both default to None for backward compatibility with tests.
 
         Args:
-            deep: If False, uses gemma4:e4b (passive, fast).
-                  If True, uses gemma4:26b (deep, detailed analysis).
+            deep: If False, uses screen_vision_passive agent (gemma4:e4b).
+                  If True, uses screen_vision_deep agent (gemma4:26b).
+            mode_manager: ModeManager singleton from gateway.
+            agent_registry: AgentRegistry singleton from gateway.
 
         Returns:
-            dict with description (str), app_detected (str), context (str),
-            timestamp (str), screenshot_b64 (str).
+            dict with keys:
+              description (str)  — human-readable description of screen
+              app_detected (str) — primary app: vscode/browser/terminal/finder/other
+              context (str)      — brief context: "TypeScript file auth.ts line 26"
+              suggestions (list) — list of suggested actions (may be empty)
+              timestamp (str)    — ISO 8601 UTC timestamp
+              screenshot_b64 (str) — base64 PNG (empty if capture failed)
+              deep (bool)        — whether deep model was used
+              model_used (str)   — actual model used
         """
+        import asyncio
         timestamp = datetime.now(timezone.utc).isoformat()
-        model_label = "gemma4:26b (deep)" if deep else "gemma4:e4b (passive)"
 
-        if not self._mss_available:
-            logger.info("Screen capture stub called (mss unavailable) — deep=%s.", deep)
+        # Capture screenshot
+        screenshot_bytes = await self.capture_screenshot()
+        encoded = ""
+        if screenshot_bytes:
+            encoded = base64.b64encode(screenshot_bytes).decode("utf-8")
+
+        if not screenshot_bytes:
             return {
-                "description": (
-                    "Screen capture is not yet active, Sir. "
-                    "Phase 5 will enable live visual understanding using "
-                    f"{model_label}."
-                ),
+                "description": "Screen capture unavailable, Sir. mss library may not be installed.",
                 "app_detected": "unknown",
-                "context": "Phase 5 stub",
+                "context": "capture_failed",
+                "suggestions": [],
                 "timestamp": timestamp,
                 "screenshot_b64": "",
+                "deep": deep,
+                "model_used": "none",
             }
 
-        # Phase 5 implementation will replace this block:
-        screenshot_bytes = await self.capture_screenshot()
-        encoded = base64.b64encode(screenshot_bytes).decode("utf-8") if screenshot_bytes else ""
+        # If no mode_manager, return basic capture-only result
+        if mode_manager is None:
+            return {
+                "description": "Screen captured, Sir. Vision inference requires mode_manager.",
+                "app_detected": "unknown",
+                "context": "no_inference",
+                "suggestions": [],
+                "timestamp": timestamp,
+                "screenshot_b64": encoded,
+                "deep": deep,
+                "model_used": "none",
+            }
 
-        return {
-            "description": (
-                "Screen captured successfully, Sir. "
-                "Visual analysis will be active in Phase 5."
-            ),
-            "app_detected": "unknown",
-            "context": "Phase 5 vision stub — capture only, no inference yet.",
-            "timestamp": timestamp,
-            "screenshot_b64": encoded,
+        # Select agent based on deep flag
+        agent_name = "screen_vision_deep" if deep else "screen_vision_passive"
+
+        # Get system prompt for the selected agent
+        system_prompt = ""
+        if agent_registry:
+            system_prompt = agent_registry.get_system_prompt(agent_name)
+
+        # Build the user message for vision analysis
+        user_message = (
+            "Analyze the current screen. Provide a structured response in this EXACT format:\n\n"
+            "APP: <one of: vscode, browser, terminal, finder, slack, notion, figma, media_player, pdf_viewer, other>\n"
+            "CONTEXT: <one sentence: what specifically is on screen, e.g. 'TypeScript file auth.ts, async function handleLogin at line 26'>\n"
+            "DESCRIPTION: <2-3 sentences describing what the user appears to be doing>\n"
+            "SUGGESTION: <ONE specific, actionable suggestion OR 'none' if nothing useful>\n\n"
+            "Be concise and specific. Do not repeat information across sections."
+        )
+
+        try:
+            result = await mode_manager.complete(
+                agent_name=agent_name,
+                system_prompt=system_prompt,
+                user_message=user_message,
+                complexity_score=3 if not deep else 6,
+                images=[screenshot_bytes],
+                temperature=0.2,
+                max_tokens=512,
+            )
+
+            raw_response = result.get("content", "")
+            model_used = result.get("model_used", "unknown")
+
+            # Parse the structured response
+            parsed = self._parse_vision_response(raw_response)
+
+            return {
+                "description": parsed["description"],
+                "app_detected": parsed["app"],
+                "context": parsed["context"],
+                "suggestions": [parsed["suggestion"]] if parsed["suggestion"] != "none" else [],
+                "timestamp": timestamp,
+                "screenshot_b64": encoded if deep else "",  # Only include in deep mode
+                "deep": deep,
+                "model_used": model_used,
+                "raw_response": raw_response,
+            }
+
+        except Exception as exc:
+            logger.error("Vision inference failed: %s", exc)
+            return {
+                "description": f"Vision inference failed, Sir: {exc}",
+                "app_detected": "unknown",
+                "context": "inference_error",
+                "suggestions": [],
+                "timestamp": timestamp,
+                "screenshot_b64": encoded,
+                "deep": deep,
+                "model_used": "error",
+            }
+
+    def _parse_vision_response(self, raw: str) -> dict:
+        """
+        Parse the structured vision response from the LLM.
+        Returns dict with app, context, description, suggestion.
+        """
+        result = {
+            "app": "other",
+            "context": "",
+            "description": raw,
+            "suggestion": "none",
         }
+
+        lines = raw.strip().split("\n")
+        description_lines = []
+
+        for line in lines:
+            line = line.strip()
+            if line.startswith("APP:"):
+                app_raw = line[4:].strip().lower()
+                # Normalize app names
+                app_map = {
+                    "vscode": "vscode", "vs code": "vscode", "visual studio code": "vscode",
+                    "browser": "browser", "chrome": "browser", "safari": "browser",
+                    "firefox": "browser", "edge": "browser",
+                    "terminal": "terminal", "iterm": "terminal", "iterm2": "terminal",
+                    "finder": "finder", "file explorer": "finder",
+                    "slack": "slack", "notion": "notion", "figma": "figma",
+                    "media_player": "media_player", "vlc": "media_player",
+                    "pdf_viewer": "pdf_viewer", "preview": "pdf_viewer",
+                }
+                result["app"] = app_map.get(app_raw, app_raw if app_raw else "other")
+            elif line.startswith("CONTEXT:"):
+                result["context"] = line[8:].strip()
+            elif line.startswith("DESCRIPTION:"):
+                result["description"] = line[12:].strip()
+            elif line.startswith("SUGGESTION:"):
+                sugg = line[11:].strip()
+                result["suggestion"] = "none" if sugg.lower() in ("none", "n/a", "-", "") else sugg
+
+        # Fallback: if description is still the raw response, use it
+        if result["description"] == raw and description_lines:
+            result["description"] = " ".join(description_lines)
+
+        return result
 
     async def capture_screenshot(self) -> bytes:
         """
@@ -107,3 +234,11 @@ class ScreenVision:
         except Exception as exc:  # noqa: BLE001
             logger.error("Screenshot capture failed: %s", exc)
             return b""
+
+_vision_instance: Optional[ScreenVision] = None
+
+def get_screen_vision() -> ScreenVision:
+    global _vision_instance
+    if _vision_instance is None:
+        _vision_instance = ScreenVision()
+    return _vision_instance

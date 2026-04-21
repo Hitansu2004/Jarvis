@@ -48,6 +48,11 @@ logger = logging.getLogger("jarvis.gateway")
 from core_engine.agent_registry import AgentRegistry
 from core_engine.mode_manager import ModeManager, get_mode_manager
 from core_engine.router import ComplexityRouter
+
+from screen_engine.vision import ScreenVision, get_screen_vision
+from screen_engine.passive_watcher import PassiveWatcher
+from screen_engine.context_classifier import get_context_classifier
+from screen_engine.suggestion_engine import get_suggestion_engine
 from sandbox.security_enforcer import SecurityEnforcer, get_security_enforcer
 from sandbox.audit_manager import AuditManager, get_audit_manager
 from voice_engine.tts import get_tts_engine, TTSEngine
@@ -85,6 +90,10 @@ _voice_session: Optional[VoiceSessionManager] = None
 _tts_engine: Optional[TTSEngine] = None
 _stt_engine: Optional[STTEngine] = None
 
+# Phase 5 screen engine singletons
+_screen_vision: Optional[ScreenVision] = None
+_passive_watcher: Optional[PassiveWatcher] = None
+
 # Phase 4 memory singletons
 _chroma_store: Optional[ChromaStore] = None
 _graphiti_store: Optional[GraphitiStore] = None
@@ -104,6 +113,12 @@ class ChatRequest(BaseModel):
     message: str
     context: Optional[str] = None
     mode_override: Optional[str] = None
+
+class ScreenDescribeRequest(BaseModel):
+    deep: bool = False  # False = passive (E4B), True = deep (26B)
+
+class ScreenSuppressRequest(BaseModel):
+    seconds: int = 120
 
 
 class ChatResponse(BaseModel):
@@ -247,6 +262,7 @@ async def lifespan(app: FastAPI):
     """
     global _registry, _router, _mode_manager, _security_enforcer, _audit, _voice_session, _tts_engine, _stt_engine
     global _chroma_store, _graphiti_store, _retriever, _distiller, _conv_logger, _distiller_scheduler
+    global _screen_vision, _passive_watcher
 
     import asyncio
 
@@ -419,9 +435,38 @@ async def lifespan(app: FastAPI):
     except Exception as _pe:
         logger.warning(f"profile_updater skipped: {_pe}")
 
+    # ── Phase 5: Initialize screen vision ────────────────────────────────────
+    _screen_vision = get_screen_vision()
+    logger.info("ScreenVision initialized — mss_available=%s", _screen_vision._mss_available)
+
+    # Create and wire PassiveWatcher
+    async def _tts_speak_suggestion(text: str) -> None:
+        """TTS callback for proactive suggestions from the passive watcher."""
+        if _voice_session:
+            try:
+                await _voice_session.speak_immediately(text, urgent=False)
+            except Exception as exc:
+                logger.warning("Suggestion TTS failed: %s", exc)
+
+    _passive_watcher = PassiveWatcher(suggestion_callback=lambda s: None)
+    _passive_watcher.inject_dependencies(
+        vision=_screen_vision,
+        mode_manager=_mode_manager,
+        agent_registry=_registry,
+        tts_speak_callback=_tts_speak_suggestion,
+    )
+
+    if os.getenv("SCREEN_VISION_ENABLED", "true").lower() == "true":
+        _passive_watcher.start()
+        logger.info("PassiveWatcher started.")
+    else:
+        logger.info("PassiveWatcher NOT started — SCREEN_VISION_ENABLED=false")
+
     yield  # ← server runs here
 
     # ---- Shutdown ----
+    if _passive_watcher:
+        _passive_watcher.stop()
     if _distiller_scheduler:
         try:
             _distiller_scheduler.shutdown(wait=False)
@@ -630,6 +675,24 @@ async def chat(request: ChatRequest, speak: bool = False):
                 system_prompt = f"{system_prompt}\n\n{memory_context}"
         except Exception as _mem_exc:
             logger.warning("Memory context retrieval failed (non-critical): %s", _mem_exc)
+
+    # Optional: inject screen context for screen-related queries
+    SCREEN_TRIGGER_KEYWORDS = ["screen", "see", "looking at", "on screen", "current file",
+                                 "what am i", "what's open", "my code", "this function"]
+    if (_passive_watcher and _passive_watcher.get_last_context() and
+            any(kw in request.message.lower() for kw in SCREEN_TRIGGER_KEYWORDS)):
+        last_ctx = _passive_watcher.get_last_context()
+        screen_desc = last_ctx.get("description", "")
+        screen_context_str = last_ctx.get("context", "")
+        if screen_desc or screen_context_str:
+            screen_inject = (
+                f"\n\n## CURRENT SCREEN CONTEXT\n"
+                f"App: {last_ctx.get('app_detected', 'unknown')}\n"
+                f"Context: {screen_context_str}\n"
+                f"Description: {screen_desc}\n"
+                f"## END SCREEN CONTEXT\n"
+            )
+            system_prompt = system_prompt + screen_inject
 
     # Read per-agent temperature from registry
     agent_def = _registry.get_agent(recommended_agent)
@@ -970,24 +1033,118 @@ async def memory_correct(request: MemoryCorrectRequest):
     }
 
 
+@app.post("/screen/describe")
+async def screen_describe(request: ScreenDescribeRequest):
+    """
+    Capture and describe the current screen on demand.
+
+    Use deep=false for a quick E4B description (default).
+    Use deep=true for a thorough 26B analysis.
+
+    Returns:
+        Full vision output dict including description, app_detected,
+        context, suggestions, model_used.
+    """
+    if not _screen_vision:
+        return {"error": "Screen vision not initialized"}
+
+    result = await _screen_vision.capture_and_describe(
+        deep=request.deep,
+        mode_manager=_mode_manager,
+        agent_registry=_registry,
+    )
+    return result
+
 @app.post("/screen/capture")
 async def screen_capture():
     """
-    Capture and describe the current screen.
-
-    Phase 5 stub — returns placeholder description until vision is activated.
-
-    Returns:
-        JSON with placeholder description and current timestamp.
+    Capture and describe the current screen (quick passive mode).
+    Kept for backward compatibility with Phase 1 tests.
+    Now calls the real vision pipeline.
     """
-    logger.info("Screen capture stub called — awaiting Phase 5.")
-    return {
-        "description": (
-            "Screen capture is not yet active, Sir. "
-            "The vision engine will be fully operational in Phase 5."
-        ),
-        "timestamp": _iso_now(),
-    }
+    if not _screen_vision:
+        return {
+            "description": "Screen vision not initialized.",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    result = await _screen_vision.capture_and_describe(
+        deep=False,
+        mode_manager=_mode_manager,
+        agent_registry=_registry,
+    )
+    return result
+
+@app.post("/screen/watch/start")
+async def screen_watch_start():
+    """Start the passive screen watcher."""
+    if not _passive_watcher:
+        return {"status": "error", "message": "PassiveWatcher not initialized"}
+    if _passive_watcher.running:
+        return {"status": "already_running"}
+    _passive_watcher.start()
+    return {"status": "started", "cooldown_seconds": _passive_watcher.cooldown_seconds}
+
+@app.post("/screen/watch/stop")
+async def screen_watch_stop():
+    """Stop the passive screen watcher."""
+    if not _passive_watcher:
+        return {"status": "error", "message": "PassiveWatcher not initialized"}
+    _passive_watcher.stop()
+    return {"status": "stopped"}
+
+@app.get("/screen/watch/status")
+async def screen_watch_status():
+    """Return full passive watcher status."""
+    if not _passive_watcher:
+        return {"running": False, "error": "PassiveWatcher not initialized"}
+    return _passive_watcher.get_status()
+
+@app.get("/screen/context")
+async def screen_context():
+    """Return the most recent classified screen context."""
+    if not _passive_watcher:
+        return {"error": "PassiveWatcher not initialized"}
+    last = _passive_watcher.get_last_context()
+    if not last:
+        return {
+            "app_detected": "unknown",
+            "context": "No screen captures processed yet",
+            "description": "The passive watcher has not yet processed a frame.",
+        }
+    return last
+
+@app.post("/screen/suppress")
+async def screen_suppress(request: ScreenSuppressRequest):
+    """Suppress proactive suggestions for N seconds."""
+    if _passive_watcher:
+        _passive_watcher.suppress_for(request.seconds)
+    suggestion_engine = get_suggestion_engine()
+    suggestion_engine.suppress_for(request.seconds)
+
+    minutes = request.seconds // 60
+    msg = (
+        f"Understood, Sir. I will hold my suggestions for "
+        f"{'1 minute' if minutes == 1 else f'{minutes} minutes' if minutes > 1 else f'{request.seconds} seconds'}. "
+        f"I will continue watching and will queue anything important."
+    )
+    if _voice_session:
+        await _voice_session.speak_immediately(msg, urgent=True)
+    return {"status": "suppressed", "seconds": request.seconds, "message": msg}
+
+@app.get("/screen/suppressed")
+async def screen_suppressed():
+    """Return queued suggestions that were generated during suppression."""
+    if not _passive_watcher:
+        return {"suggestions": [], "count": 0}
+    suggestions = _passive_watcher.get_suppressed_suggestions()
+    if suggestions and _voice_session:
+        intro = (
+            f"Sir, I noticed {len(suggestions)} thing"
+            f"{'s' if len(suggestions) > 1 else ''} while I was quiet — shall I share them?"
+        )
+        await _voice_session.speak_immediately(intro, urgent=False)
+    return {"suggestions": suggestions, "count": len(suggestions)}
+
 
 
 @app.post("/control/override")
